@@ -1,0 +1,210 @@
+package linux
+
+// arm64Numbers maps syscall names to AArch64 numbers.
+// Source: Linux 6.x arch/arm64/include/asm/unistd.h
+// -1 means unavailable on this arch; frontends must use the *at / clone3 equivalent.
+var arm64Numbers = map[string]int{
+	// fs
+	"read":               63,
+	"write":              64,
+	"open":               -1, // use openat
+	"close":              57,
+	"stat":               -1, // use fstatat
+	"fstat":              80,
+	"lstat":              -1, // use fstatat
+	"poll":               73,
+	"lseek":              62,
+	"pread64":            67,
+	"pwrite64":           68,
+	"readv":              65,
+	"writev":             66,
+	"access":             -1, // use faccessat
+	"pipe":               -1, // use pipe2
+	"select":             -1, // use pselect6
+	"dup":                23,
+	"dup2":               -1, // use dup3
+	"dup3":               24,
+	"fcntl":              25,
+	"flock":              32,
+	"fsync":              82,
+	"fdatasync":          83,
+	"truncate":           45,
+	"ftruncate":          46,
+	"getdents":           -1, // use getdents64
+	"getdents64":         61,
+	"getcwd":             17,
+	"chdir":              49,
+	"fchdir":             50,
+	"rename":             -1, // use renameat
+	"mkdir":              -1, // use mkdirat
+	"rmdir":              -1, // use unlinkat
+	"creat":              -1,
+	"link":               -1, // use linkat
+	"unlink":             -1, // use unlinkat
+	"symlink":            -1, // use symlinkat
+	"readlink":           -1, // use readlinkat
+	"chmod":              -1, // use fchmodat
+	"fchmod":             52,
+	"chown":              -1, // use fchownat
+	"fchown":             55,
+	"lchown":             -1,
+	"umask":              166,
+	"sendfile":           71,
+	"ioctl":              29,
+	"statfs":             43,
+	"fstatfs":            44,
+	"openat":             56,
+	"mkdirat":            34,
+	"mknodat":            33,
+	"fchownat":           54,
+	"unlinkat":           35,
+	"renameat":           38,
+	"renameat2":          276,
+	"linkat":             37,
+	"symlinkat":          36,
+	"readlinkat":         78,
+	"fchmodat":           53,
+	"faccessat":          48,
+	"inotify_init":       -1, // use inotify_init1
+	"inotify_init1":      26,
+	"inotify_add_watch":  27,
+	"inotify_rm_watch":   28,
+	"epoll_create":       -1, // use epoll_create1
+	"epoll_create1":      20,
+	"epoll_ctl":          21,
+	"epoll_wait":         -1, // use epoll_pwait
+	"epoll_pwait":        22,
+
+	// proc
+	"fork":                   -1, // use clone
+	"vfork":                  -1,
+	"clone":                  220,
+	"clone3":                 435,
+	"execve":                 221,
+	"exit":                   93,
+	"exit_group":             94,
+	"wait4":                  260,
+	"waitid":                 95,
+	"kill":                   129,
+	"tkill":                  130,
+	"tgkill":                 131,
+	"getpid":                 172,
+	"getppid":                173,
+	"gettid":                 178,
+	"getuid":                 174,
+	"geteuid":                175,
+	"getgid":                 176,
+	"getegid":                177,
+	"setuid":                 146,
+	"setgid":                 144,
+	"setreuid":               145,
+	"setregid":               143,
+	"setresuid":              147,
+	"setresgid":              149,
+	"getresuid":              148,
+	"getresgid":              150,
+	"setpgid":                154,
+	"getpgid":                155,
+	"getpgrp":                -1,
+	"setsid":                 157,
+	"getsid":                 156,
+	"setfsuid":               151,
+	"setfsgid":               152,
+	"getgroups":              158,
+	"setgroups":              159,
+	"prctl":                  167,
+	"arch_prctl":             -1,
+	"uname":                  160,
+	"ptrace":                 117,
+	"capget":                 90,
+	"capset":                 91,
+	"personality":            92,
+	"sched_yield":            124,
+	"sched_setparam":         118,
+	"sched_getparam":         121,
+	"sched_setscheduler":     119,
+	"sched_getscheduler":     120,
+	"sched_get_priority_max": 125,
+	"sched_get_priority_min": 126,
+	"sched_setaffinity":      122,
+	"sched_getaffinity":      123,
+
+	// mem
+	"mmap":       222,
+	"mprotect":   226,
+	"munmap":     215,
+	"brk":        214,
+	"mremap":     216,
+	"msync":      227,
+	"mincore":    232,
+	"madvise":    233,
+	"mlock":      228,
+	"munlock":    229,
+	"mlockall":   230,
+	"munlockall": 231,
+	"shmget":     194,
+	"shmat":      196,
+	"shmdt":      197,
+	"shmctl":     195,
+
+	// net
+	"socket":      198,
+	"connect":     203,
+	"accept":      202,
+	"accept4":     242,
+	"sendto":      206,
+	"recvfrom":    207,
+	"sendmsg":     211,
+	"recvmsg":     212,
+	"shutdown":    210,
+	"bind":        200,
+	"listen":      201,
+	"getsockname": 204,
+	"getpeername": 205,
+	"socketpair":  199,
+	"setsockopt":  208,
+	"getsockopt":  209,
+	"sendmmsg":    269,
+	"recvmmsg":    243,
+
+	// time
+	"gettimeofday":     169,
+	"settimeofday":     170,
+	"nanosleep":        101,
+	"clock_gettime":    113,
+	"clock_settime":    112,
+	"clock_getres":     114,
+	"clock_nanosleep":  115,
+	"getitimer":        102,
+	"setitimer":        103,
+	"alarm":            -1,
+	"timer_create":     107,
+	"timer_settime":    110,
+	"timer_gettime":    108,
+	"timer_getoverrun": 109,
+	"timer_delete":     111,
+	"adjtimex":         171,
+	"times":            153,
+
+	// signal
+	"rt_sigaction":    134,
+	"rt_sigprocmask":  135,
+	"rt_sigreturn":    139,
+	"rt_sigpending":   136,
+	"rt_sigtimedwait": 137,
+	"rt_sigqueueinfo": 138,
+	"rt_sigsuspend":   133,
+	"sigaltstack":     132,
+
+	// sync
+	"futex":           98,
+	"set_tid_address": 96,
+	"semget":          190,
+	"semop":           193,
+	"semtimedop":      -1,
+	"semctl":          191,
+	"msgget":          186,
+	"msgsnd":          189,
+	"msgrcv":          188,
+	"msgctl":          187,
+}
