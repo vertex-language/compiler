@@ -1,19 +1,11 @@
 package memory
 
-import "github.com/vertex-language/compiler/object"
+import "github.com/vertex-language/compiler/context"
 
-// CompileResult holds the compiled allocator stubs and state block.
-type CompileResult struct {
-	Obj *object.WasmObj
-}
-
-// Compile generates all allocator stubs and returns a WasmObj to be merged
-// with the CPU object before linking. The returned object contains:
-//
-//	.data  — __vertex_alloc_state (StateSize zeroed bytes)
-//	.text  — __vertex_memory_init + all stub functions
-func Compile() (*CompileResult, error) {
-	e := newEmitter()
+// Emit generates all allocator stubs for x86_64 and appends them
+// directly into the shared compilation context's WasmObj.
+func Emit(ctx *context.BuildContext) error {
+	e := newEmitter(ctx.Obj)
 
 	// Allocator state block: one zeroed page, RIP-addressed by every stub.
 	e.dataLabel("__vertex_alloc_state")
@@ -43,5 +35,8 @@ func Compile() (*CompileResult, error) {
 	emitArenaPop(e)
 	emitArenaAlloc(e)
 
-	return &CompileResult{Obj: e.obj()}, nil
+	// Flush all accumulated code, data, symbols, and relocs into the shared obj
+	e.flush()
+
+	return nil
 }

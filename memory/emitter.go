@@ -5,17 +5,24 @@ import (
 	"github.com/vertex-language/compiler/object"
 )
 
-// emitter builds the allocator object. It embeds asm.Assembler so every
-// instruction-emission method is available directly, and layers symbol and
-// relocation accounting on top — exactly as described in the cpu/ README.
+// emitter builds the allocator object and flushes it directly into a shared WasmObj.
 type emitter struct {
 	asm.Assembler                 // all x86-64 instruction methods live here
-	syms   []object.Symbol
-	relocs []object.Reloc
-	data   []byte
+	obj        *object.WasmObj
+	codeOffset int
+	dataOffset int
+	syms       []object.Symbol
+	relocs     []object.Reloc
+	data       []byte
 }
 
-func newEmitter() *emitter { return &emitter{} }
+func newEmitter(obj *object.WasmObj) *emitter {
+	return &emitter{
+		obj:        obj,
+		codeOffset: len(obj.Code), // Offset against any existing code in the shared obj
+		dataOffset: len(obj.Data), // Offset against any existing data in the shared obj
+	}
+}
 
 // ── Symbol / relocation accounting ───────────────────────────────────────────
 
@@ -24,7 +31,7 @@ func (e *emitter) codeLabel(name string) {
 	e.syms = append(e.syms, object.Symbol{
 		Name:   name,
 		Kind:   object.SymDefined,
-		Offset: e.Pos(),
+		Offset: e.codeOffset + e.Pos(),
 	})
 }
 
@@ -33,7 +40,7 @@ func (e *emitter) dataLabel(name string) {
 	e.syms = append(e.syms, object.Symbol{
 		Name:    name,
 		Kind:    object.SymDefined,
-		Offset:  len(e.data),
+		Offset:  e.dataOffset + len(e.data),
 		Section: object.SymSecData,
 	})
 }
@@ -46,7 +53,7 @@ func (e *emitter) dataZero(n int) {
 // rel32Sym emits a 4-byte zero placeholder and records a RelocRel32 against sym.
 func (e *emitter) rel32Sym(sym string) {
 	e.relocs = append(e.relocs, object.Reloc{
-		Offset: e.Pos(),
+		Offset: e.codeOffset + e.Pos(),
 		Symbol: sym,
 		Kind:   object.RelocRel32,
 	})
@@ -76,17 +83,7 @@ func (e *emitter) jmpSym(sym string) {
 // ── Lazy-init guard ───────────────────────────────────────────────────────────
 
 // initCheck emits the lazy-init guard at the top of every stub that touches
-// the heap or arena. Loads &__vertex_alloc_state into stateReg; if heap_base
-// is zero calls __vertex_memory_init first, then reloads stateReg.
-//
-//	lea stateReg, [rip + __vertex_alloc_state]
-//	mov tmp,      [stateReg + StateHeapBase]
-//	test tmp, tmp
-//	jnz .already_init
-//	call __vertex_memory_init
-//	lea stateReg, [rip + __vertex_alloc_state]
-//
-// .already_init:
+// the heap or arena.
 func (e *emitter) initCheck(stateReg, tmp int) {
 	e.leaRIPSym(stateReg, "__vertex_alloc_state")
 	e.LoadMem64(tmp, stateReg, StateHeapBase)
@@ -99,13 +96,11 @@ func (e *emitter) initCheck(stateReg, tmp int) {
 
 // ── Object assembly ───────────────────────────────────────────────────────────
 
-// obj assembles the final WasmObj from all accumulated code, data, symbols,
-// and relocations.
-func (e *emitter) obj() *object.WasmObj {
-	return &object.WasmObj{
-		Code:    e.Bytes(),
-		Data:    e.data,
-		Symbols: e.syms,
-		Relocs:  e.relocs,
-	}
+// flush appends all accumulated code, data, symbols, and relocations directly 
+// into the shared build context object.
+func (e *emitter) flush() {
+	e.obj.Code = append(e.obj.Code, e.Bytes()...)
+	e.obj.Data = append(e.obj.Data, e.data...)
+	e.obj.Symbols = append(e.obj.Symbols, e.syms...)
+	e.obj.Relocs = append(e.obj.Relocs, e.relocs...)
 }

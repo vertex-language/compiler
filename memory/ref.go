@@ -17,55 +17,34 @@ const (
 	rcSize   = int64(-RCHeaderSize + 28)
 )
 
-// emitRefAlloc emits __vertex_memory_ref_alloc(size i32) → i32.
-//
-// Allocates (size + RCHeaderSize) bytes from the heap, initialises the RC
-// header (strong=1, weak=0, dtor=0), zeroes the user area, and returns the
-// wasm offset past the header.
-//
-// Register map:
-//
-//	r14 = user_size
-//	r13 = &__vertex_alloc_state
-//	rbx = allocated block (native heap-user pointer = start of RC header)
-//	rcx = size class
 func emitRefAlloc(e *emitter) {
 	e.codeLabel("__vertex_memory_ref_alloc")
 	align := e.Prologue([]int{asm.RBX, asm.R13, asm.R14})
 
+	e.MovRR32(asm.R14, asm.RDI)           // save user_size BEFORE initCheck clobbers rdi
 	e.initCheck(asm.R13, asm.RAX)
-
-	e.MovRR32(asm.R14, asm.RDI)           // r14 = user_size
+	e.MovRR32(asm.RDI, asm.R14)           // restore rdi from r14 (init may have clobbered it)
 	e.AddRI(asm.RDI, RCHeaderSize)        // rdi = RCHeaderSize + user_size
 
-	// heap_alloc_raw(RCHeaderSize + user_size) → rax = wasm ptr past
-	// the 8-byte heap block header. That wasm ptr is the start of the
-	// RC header in linear memory, so ref_release can later pass it
-	// directly to heap_free.
 	e.callSym("__vertex_memory_heap_alloc_raw")
 
-	// rbx = native ptr to start of RC header (= heap user area)
 	e.MovRR(asm.RBX, asm.RAX)
 	e.AddRR(asm.RBX, asm.R15)
 
-	// Re-read size_class written by heap_alloc_raw into the heap header.
 	e.LoadMem32ZX(asm.RCX, asm.RBX, int64(-HeapBlockHeaderSize))
 
-	// Initialise RC header at [rbx+0 .. rbx+31].
-	e.StoreMem64Imm(asm.RBX, 0, 1)           // strong_count = 1
-	e.StoreMem64Zero(asm.RBX, 8)             // weak_count   = 0
-	e.StoreMem64Zero(asm.RBX, 16)            // dtor_fn_ptr  = 0
-	e.StoreMem32R(asm.RBX, 24, asm.RCX)      // size_class   = ecx
-	e.StoreMem32R(asm.RBX, 28, asm.R14)      // user_size    = r14d
+	e.StoreMem64Imm(asm.RBX, 0, 1)
+	e.StoreMem64Zero(asm.RBX, 8)
+	e.StoreMem64Zero(asm.RBX, 16)
+	e.StoreMem32R(asm.RBX, 24, asm.RCX)
+	e.StoreMem32R(asm.RBX, 28, asm.R14)
 
-	// Zero the user area: [rbx+RCHeaderSize .. +user_size)
 	e.MovRR(asm.RDI, asm.RBX)
 	e.AddRI(asm.RDI, RCHeaderSize)
 	e.XorRR32(asm.RAX)
 	e.MovRR32(asm.RCX, asm.R14)
 	e.RepStosb()
 
-	// Return wasm offset = (rbx + RCHeaderSize) − R15.
 	e.MovRR(asm.RAX, asm.RBX)
 	e.AddRI(asm.RAX, RCHeaderSize)
 	e.SubRR(asm.RAX, asm.R15)

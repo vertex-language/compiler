@@ -60,6 +60,17 @@ func Link(objs []*object.WasmObj, opts Options) ([]byte, error) {
 		}
 	}
 
+	// ── INJECT WASM SYNTHETIC SYMBOLS ─────────────────────────────────────────
+	// Provide standard WebAssembly synthetic symbols if the CPU backend 
+	// generated relocations against them.
+	if lnk.sym.refs["__wasm_data_base"] {
+		_ = lnk.sym.define("__wasm_data_base", object.SymSecData, 0)
+	}
+	if lnk.sym.refs["__wasm_memory_base"] {
+		_ = lnk.sym.define("__wasm_memory_base", object.SymSecBSS, 0)
+	}
+	// ──────────────────────────────────────────────────────────────────────────
+
 	// INJECT ELF ENTRY STUB
 	// Forcefully align the stack to 16 bytes, call the Wasm entry point,
 	// and cleanly terminate the process using SYS_exit_group with exit code 0.
@@ -83,8 +94,6 @@ func Link(objs []*object.WasmObj, opts Options) ([]byte, error) {
 
 	if len(lnk.sym.refs) > 0 {
 		lnk.ds = lnk.buildDynamic()
-		// Removed the erroneous lnk.sym.define loop here.
-		// resolveSymbolVA natively intercepts dynamic symbols.
 	} else {
 		if err := lnk.checkResolved(); err != nil {
 			return nil, err
@@ -210,7 +219,6 @@ func (lnk *linker) resolveSymbolVA(name string) (uint64, bool) {
 func (lnk *linker) patchDynamicVAs() {
 	le := binary.LittleEndian
 
-	// 1. Patch tags with actual Virtual Addresses
 	for i := 0; i < len(lnk.ds.dynamic); i += 16 {
 		tag := le.Uint64(lnk.ds.dynamic[i:])
 		switch tag {
@@ -223,7 +231,6 @@ func (lnk *linker) patchDynamicVAs() {
 
 	le.PutUint64(lnk.ds.gotPlt[0:], lnk.lay.DynamicVA)
 
-	// 2. Wire up the PLT assembly and Relocations
 	for i := range lnk.ds.dynSyms {
 		gotSlotIdx := i + 3
 		gotSlotVA := lnk.lay.GotPltVA + uint64(gotSlotIdx*8)
@@ -231,17 +238,14 @@ func (lnk *linker) patchDynamicVAs() {
 		pltStubVA := lnk.lay.PltVA + 16 + uint64(i*16)
 		pushVA := pltStubVA + 6
 
-		// Point GOT slot to the push instruction (for lazy binding)
 		le.PutUint64(lnk.ds.gotPlt[gotSlotIdx*8:], pushVA)
 
-		// Fix the Reloc Type to R_X86_64_JUMP_SLOT (7)
 		relaBase := i * 24
 		le.PutUint64(lnk.ds.relaPlt[relaBase:], gotSlotVA)
-		rInfo := (uint64(i+1) << 32) | 7 // Symbol index i+1 (0 is NULL), Type 7
+		rInfo := (uint64(i+1) << 32) | 7 
 		le.PutUint64(lnk.ds.relaPlt[relaBase+8:], rInfo)
 		le.PutUint64(lnk.ds.relaPlt[relaBase+16:], 0) 
 
-		// Patch jump offsets in our synthesized machine code
 		disp32 := int64(gotSlotVA) - int64(pltStubVA+6)
 		le.PutUint32(lnk.ds.plt[16+i*16+2:], uint32(int32(disp32)))
 

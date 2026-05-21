@@ -371,8 +371,8 @@ func (fc *funcCompiler) dispatchOp(r *decode.Reader, op byte) error {
 			return err
 		}
 		pages := uint32(0)
-		if fc.m.Memories.Len() > 0 {
-			pages = fc.m.Memories.Entries[0].Lim.Min
+		if fc.ctx.Module.Memories.Len() > 0 {
+			pages = fc.ctx.Module.Memories.Entries[0].Lim.Min
 		}
 		fc.Emit(0x68)
 		fc.Emit32(pages)

@@ -122,17 +122,6 @@ func emitAllocBlock(e *emitter, stateReg, dstReg int) {
 	e.Patch32(toGotBlock2, e.Pos())
 }
 
-// emitHeapAllocCore emits __vertex_memory_heap_alloc (zero=true) or
-// __vertex_memory_heap_alloc_raw (zero=false).
-//
-// Register map:
-//
-//	r13 = &__vertex_alloc_state
-//	r14 = user_size (original edi, saved early)
-//	rbx = allocated block (native pointer)
-//	rcx = size class
-//	r12 = slot size  →  modified by emitBumpAlloc after use
-//	rdi = total size (user_size + HeapBlockHeaderSize)
 func emitHeapAllocCore(e *emitter, zero bool) {
 	sym := "__vertex_memory_heap_alloc"
 	if !zero {
@@ -141,30 +130,25 @@ func emitHeapAllocCore(e *emitter, zero bool) {
 	e.codeLabel(sym)
 	align := e.Prologue([]int{asm.RBX, asm.R12, asm.R13, asm.R14})
 
+	e.MovRR32(asm.R14, asm.RDI)           // save user_size BEFORE initCheck clobbers rdi
 	e.initCheck(asm.R13, asm.RAX)
-
-	// Save user_size; compute total for class/bump decisions.
-	e.MovRR32(asm.R14, asm.RDI)             // r14d = user_size
-	e.AddRI(asm.RDI, HeapBlockHeaderSize)   // rdi  = total
+	e.MovRR32(asm.RDI, asm.R14)           // restore rdi from r14 (init may have clobbered it)
+	e.AddRI(asm.RDI, HeapBlockHeaderSize) // rdi = total
 
 	emitComputeClass(e, asm.RDI, asm.RCX, asm.R12)
 	emitAllocBlock(e, asm.R13, asm.RBX)
-	// RBX = native block pointer, RCX = class (preserved through alloc).
 
-	// Write heap block header.
-	e.StoreMem32R(asm.RBX, 0, asm.RCX) // [rbx+0] = size_class (ecx)
-	e.StoreMem32R(asm.RBX, 4, asm.R14) // [rbx+4] = user_size  (r14d)
+	e.StoreMem32R(asm.RBX, 0, asm.RCX)
+	e.StoreMem32R(asm.RBX, 4, asm.R14)
 
 	if zero {
-		// Zero user area with REP STOSB: AL=0, RDI=user ptr, RCX=user_size.
 		e.MovRR(asm.RDI, asm.RBX)
 		e.AddRI(asm.RDI, HeapBlockHeaderSize)
-		e.XorRR32(asm.RAX)          // al = 0
-		e.MovRR32(asm.RCX, asm.R14) // ecx = user_size
+		e.XorRR32(asm.RAX)
+		e.MovRR32(asm.RCX, asm.R14)
 		e.RepStosb()
 	}
 
-	// Return wasm offset = (block + HeapBlockHeaderSize) − R15.
 	e.MovRR(asm.RAX, asm.RBX)
 	e.AddRI(asm.RAX, HeapBlockHeaderSize)
 	e.SubRR(asm.RAX, asm.R15)

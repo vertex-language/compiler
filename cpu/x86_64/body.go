@@ -39,10 +39,10 @@ func (fc *funcCompiler) readBlockType(r *decode.Reader) (int, int, error) {
 		return 0, 1, nil
 	default: // type index
 		idx := uint32(v)
-		if int(idx) >= len(fc.m.Types.Entries) {
+		if int(idx) >= len(fc.ctx.Module.Types.Entries) {
 			return 0, 0, fmt.Errorf("block type index %d out of range", idx)
 		}
-		ft := fc.m.Types.Entries[idx]
+		ft := fc.ctx.Module.Types.Entries[idx]
 		return len(ft.Params), len(ft.Results), nil
 	}
 }

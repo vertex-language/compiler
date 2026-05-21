@@ -1,6 +1,7 @@
 package x86_64
 
 import (
+	"github.com/vertex-language/compiler/context"
 	"github.com/vertex-language/compiler/cpu/x86_64/asm"
 	"github.com/vertex-language/compiler/decode"
 	"github.com/vertex-language/compiler/wasm"
@@ -30,32 +31,33 @@ type funcReloc struct {
 	isAbs64 bool
 }
 
-// funcCompiler compiles a single wasm function body to x86-64 machine code.
-// It embeds asm.Assembler so all instruction-emission methods are available
-// directly (fc.Push, fc.Pop, fc.LoadMem64, etc.) without a named field.
 type funcCompiler struct {
-	asm.Assembler // raw x86-64 emitter — owns the output byte buffer
+	asm.Assembler // raw x86-64 emitter
 
-	m              *wasm.Module
+	ctx            *context.BuildContext // Replaces m and importPtrMasks
 	ft             wasm.FuncType
 	locals         []wasm.ValType
-	importPtrMasks map[int][]bool
 	inlinedImports map[int]inlinedImport
 
 	ctrl      []ctrlFrame
-	depth     int  // current wasm operand-stack depth (in pushed 8-byte slots)
-	dead      bool // true if current position is unreachable
-	deadDepth int  // nested dead-scope counter
+	depth     int
+	dead      bool
+	deadDepth int
 	relocs    []funcReloc
 }
 
 func compileFuncBody(
-	m *wasm.Module,
-	ft wasm.FuncType,
-	body *wasm.FunctionBody,
-	importPtrMasks map[int][]bool,
+	ctx *context.BuildContext,
+	funcIdx int,
 	inlinedImports map[int]inlinedImport,
 ) ([]byte, []funcReloc, error) {
+	
+	// Resolve the function type and body based on the index
+	localIdx := funcIdx - int(ctx.Module.Imports.NumFuncs())
+	ftIdx := ctx.Module.Functions.TypeIndices[localIdx]
+	ft := ctx.Module.Types.Entries[ftIdx]
+	body := ctx.Module.Codes.Bodies[localIdx]
+
 	var flatLocals []wasm.ValType
 	for _, g := range body.Locals() {
 		for i := uint32(0); i < g.Count; i++ {
@@ -64,10 +66,9 @@ func compileFuncBody(
 	}
 
 	fc := &funcCompiler{
-		m:              m,
+		ctx:            ctx,
 		ft:             ft,
 		locals:         flatLocals,
-		importPtrMasks: importPtrMasks,
 		inlinedImports: inlinedImports,
 	}
 	fc.ctrl = append(fc.ctrl, ctrlFrame{
@@ -98,14 +99,12 @@ func (fc *funcCompiler) emitPrologue() {
 		fc.SubRI(RSP, int64(frameSize))
 	}
 
-	// Spill register arguments into their local slots.
 	bound := nParams
 	if bound > 6 { bound = 6 }
 	for i := 0; i < bound; i++ {
 		fc.StoreLocal64(i, ArgRegs[i])
 	}
 
-	// Zero-initialise declared locals.
 	if len(fc.locals) > 0 {
 		fc.Emit(0x31, 0xC0) // xor eax, eax
 		for i := 0; i < len(fc.locals); i++ {
@@ -113,9 +112,6 @@ func (fc *funcCompiler) emitPrologue() {
 		}
 	}
 
-	// Load the wasm linear-memory base into R15:
-	//   lea r15, [rip + __wasm_data_base]
-	//   add r15, 65536
 	fc.Emit(0x4C, 0x8D, 0x3D) // lea r15, [rip + ???]
 	fc.relocs = append(fc.relocs, funcReloc{
 		codeOff: fc.Pos(),

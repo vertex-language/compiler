@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	bctx "github.com/vertex-language/compiler/context"
 	"github.com/vertex-language/compiler/cpu/x86_64/asm"
 	"github.com/vertex-language/compiler/decode"
 	"github.com/vertex-language/compiler/object"
@@ -230,17 +231,22 @@ func (c *moduleCompiler) compile() error {
 	// ── Function compilation ──────────────────────────────────────────────────
 
 	c.funcOff = make([]int, c.m.Codes.Len())
-	for i, body := range c.m.Codes.Bodies {
+	for i := range c.m.Codes.Bodies {
 		wasmIdx := numImportFuncs + i
 		if c.gpuKernels[uint32(wasmIdx)] {
 			c.funcOff[i] = len(c.code)
 			continue
 		}
-		ft := c.m.Types.Entries[c.allTypeIdx[wasmIdx]]
-		funcCode, relocs, err := compileFuncBody(c.m, ft, body, c.importPtrMasks, c.inlinedImports)
+
+		// Inject the required temporary build context to satisfy the new signature
+		tempCtx := bctx.NewBuildContext(c.m)
+		tempCtx.ImportPtrMasks = c.importPtrMasks
+
+		funcCode, relocs, err := compileFuncBody(tempCtx, wasmIdx, c.inlinedImports)
 		if err != nil {
 			return fmt.Errorf("compiler: function %d: %w", wasmIdx, err)
 		}
+
 		base := len(c.code)
 		c.funcOff[i] = base
 		for _, r := range relocs {

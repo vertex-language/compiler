@@ -40,39 +40,21 @@ func main() {
 
 	// ──────────────────────────────────────────────────────────────────────────
 
-	// Validate every "memory" import against the known signature table
-	// before spending time on compilation.
-	imports, err := memory.Detect(m)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memory.Detect: %v\n", err)
-		os.Exit(1)
-	}
-	for _, imp := range imports {
-		fmt.Printf("import  %-6s %-14s → %s\n", imp.Sub, imp.Fn, imp.Symbol)
-	}
-
-	// Compile the wasm module to native x86-64 machine code.
-	cpuObj, err := compiler.CompileWith(m, compiler.Options{})
+	// Compile the wasm module. 
+	// Under the new architecture, the compilation driver automatically detects 
+	// "memory" imports and injects the allocator stubs directly into the shared object.
+	obj, err := compiler.CompileWith(m, compiler.Options{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "compile: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Compile all allocator stubs (heap, arena, ref) into a separate object.
-	memResult, err := memory.Compile()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memory.Compile: %v\n", err)
-		os.Exit(1)
-	}
+	fmt.Printf("compiled %5d B  %d syms  %d relocs\n",
+		len(obj.Code), len(obj.Symbols), len(obj.Relocs))
 
-	fmt.Printf("cpu    %5d B  %d syms  %d relocs\n",
-		len(cpuObj.Code), len(cpuObj.Symbols), len(cpuObj.Relocs))
-	fmt.Printf("memory %5d B  %d syms  %d relocs\n",
-		len(memResult.Obj.Code), len(memResult.Obj.Symbols), len(memResult.Obj.Relocs))
-
-	// Link both objects into a single Linux ELF binary.
+	// Link the single unified object into a Linux ELF binary.
 	bin, err := linker.Link(
-		[]*object.WasmObj{cpuObj, memResult.Obj},
+		[]*object.WasmObj{obj},
 		linker.Options{Output: linker.ELF, Entry: "main"},
 	)
 	if err != nil {

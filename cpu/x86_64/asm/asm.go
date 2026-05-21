@@ -554,14 +554,16 @@ func (a *Assembler) ExitGroup(code uint32) {
 
 // MmapFixed emits a 6-argument anonymous mmap syscall.
 // Caller must set RDI = desired address before calling this.
-// Flags: PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, fd=-1, off=0.
+// Flags: PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_FIXED_NOREPLACE, fd=-1, off=0.
+// MAP_FIXED_NOREPLACE (0x100000) prevents silently clobbering live mappings —
+// the kernel returns EEXIST instead, which CheckMmapError catches cleanly.
 func (a *Assembler) MmapFixed(length uint32) {
 	a.MovRI32(RSI, length)
-	a.Emit(0xBA, 0x03, 0x00, 0x00, 0x00)       // mov edx, 3
-	a.Emit(0x41, 0xBA, 0x32, 0x00, 0x00, 0x00) // mov r10d, 0x32
-	a.MovRI64Neg1(R8)                            // mov r8, -1 (fd)
-	a.XorRR32(R9)                                // xor r9d, r9d (offset)
-	a.MovRI32(RAX, 9)                            // mov eax, 9 (SYS_mmap)
+	a.Emit(0xBA, 0x03, 0x00, 0x00, 0x00)             // mov edx,  3       (PROT_READ|PROT_WRITE)
+	a.Emit(0x41, 0xBA, 0x32, 0x00, 0x10, 0x00)       // mov r10d, 0x100032 (MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_FIXED_NOREPLACE)
+	a.MovRI64Neg1(R8)                                  // mov r8,  -1       (fd)
+	a.XorRR32(R9)                                      // xor r9d, r9d      (offset)
+	a.MovRI32(RAX, 9)                                  // mov eax,  9       (SYS_mmap)
 	a.Syscall()
 }
 

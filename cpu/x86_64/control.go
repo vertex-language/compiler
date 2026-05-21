@@ -77,21 +77,21 @@ func (fc *funcCompiler) emitCall(funcIdx int) error {
 	// ── Resolve the function type ─────────────────────────────────────────────
 
 	var ft wasm.FuncType
-	if funcIdx < int(fc.m.Imports.NumFuncs()) {
+	if funcIdx < int(fc.ctx.Module.Imports.NumFuncs()) {
 		fIdx := 0
-		for _, e := range fc.m.Imports.Entries {
+		for _, e := range fc.ctx.Module.Imports.Entries {
 			if e.Kind == wasm.ImportFunc {
 				if fIdx == funcIdx {
-					ft = fc.m.Types.Entries[e.TypeIdx]
+					ft = fc.ctx.Module.Types.Entries[e.TypeIdx]
 					break
 				}
 				fIdx++
 			}
 		}
 	} else {
-		localIdx := funcIdx - int(fc.m.Imports.NumFuncs())
-		ftIdx := fc.m.Functions.TypeIndices[localIdx]
-		ft = fc.m.Types.Entries[ftIdx]
+		localIdx := funcIdx - int(fc.ctx.Module.Imports.NumFuncs())
+		ftIdx := fc.ctx.Module.Functions.TypeIndices[localIdx]
+		ft = fc.ctx.Module.Types.Entries[ftIdx]
 	}
 
 	nParams := len(ft.Params)
@@ -122,10 +122,10 @@ func (fc *funcCompiler) emitCall(funcIdx int) error {
 	// For imports, translate any pointer parameters identified by the @ sig
 	// before aligning the stack and issuing the call instruction.
 
-	isImport := uint32(funcIdx) < fc.m.Imports.NumFuncs()
+	isImport := uint32(funcIdx) < fc.ctx.Module.Imports.NumFuncs()
 	if isImport {
-		// Pointer translation: @ sig parsed at compile time; mask stored per funcIdx.
-		ptrMask := fc.importPtrMasks[funcIdx]
+		// Pointer translation: @ sig parsed by driver; mask accessed via context.
+		ptrMask := fc.ctx.ImportPtrMasks[funcIdx]
 		for i := 0; i < bound; i++ {
 			if i < len(ptrMask) && ptrMask[i] {
 				fc.emitSafePointerTranslate(ArgRegs[i])
