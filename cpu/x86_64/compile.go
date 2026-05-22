@@ -45,39 +45,55 @@ type moduleCompiler struct {
 	qualifiedSymbols bool
 	gpuKernels       map[uint32]bool
 
-	obj            *object.WasmObj
-	code           []byte
-	funcOff        []int
-	relocs         []callReloc
-	allTypeIdx     []uint32
-	importNames    []string
-	importPtrMasks map[int][]bool
-	inlinedImports map[int]inlinedImport
-	trampolineSyms map[int]int
+	obj             *object.WasmObj
+	code            []byte
+	funcOff         []int
+	relocs          []callReloc
+	allTypeIdx      []uint32
+	importNames     []string
+	importPtrMasks  map[int][]bool
+	importHptrMasks map[int][]bool
+	returnHptrMasks map[int]bool
+	inlinedImports  map[int]inlinedImport
+	trampolineSyms  map[int]int
 }
 
-func parseImportSig(name string) (base string, ptrMask []bool) {
+func parseImportSig(name string) (base string, ptrMask []bool, hptrMask []bool, retHptr bool) {
 	idx := strings.IndexByte(name, '@')
 	if idx == -1 {
-		return name, nil
+		return name, nil, nil, false
 	}
 	base = name[:idx]
 	sig := name[idx+1:]
 	if sig == "" {
-		return base, nil
+		return base, nil, nil, false
 	}
-	parts := strings.Split(sig, ".")
-	ptrMask = make([]bool, len(parts))
-	for i, p := range parts {
-		ptrMask[i] = p == "ptr"
+
+	// Split parameters from the return type
+	parts := strings.Split(sig, ":")
+	params := parts[0]
+	if len(parts) > 1 && parts[1] == "hptr" {
+		retHptr = true
 	}
-	return base, ptrMask
+
+	if params != "" {
+		pTokens := strings.Split(params, ".")
+		ptrMask = make([]bool, len(pTokens))
+		hptrMask = make([]bool, len(pTokens))
+		for i, p := range pTokens {
+			ptrMask[i] = (p == "ptr")
+			hptrMask[i] = (p == "hptr")
+		}
+	}
+	return base, ptrMask, hptrMask, retHptr
 }
 
 func (c *moduleCompiler) compile() error {
 	c.obj = &object.WasmObj{}
 	c.inlinedImports = make(map[int]inlinedImport)
 	c.importPtrMasks = make(map[int][]bool)
+	c.importHptrMasks = make(map[int][]bool)
+	c.returnHptrMasks = make(map[int]bool)
 
 	// ── Data / memory sizing ──────────────────────────────────────────────────
 
@@ -182,21 +198,26 @@ func (c *moduleCompiler) compile() error {
 		}
 		funcIdx := numImportFuncs
 		route := platform.Parse(e.Module)
-		realName, ptrMask := parseImportSig(e.Name)
+		realName, ptrMask, hptrMask, retHptr := parseImportSig(e.Name)
 
-		// ── NEW: Intercept internal Vertex allocator imports ──
+		if hptrMask != nil {
+			c.importHptrMasks[funcIdx] = hptrMask
+		}
+		if retHptr {
+			c.returnHptrMasks[funcIdx] = true
+		}
+
+		// Intercept internal Vertex allocator imports
 		if e.Module == "memory" {
 			if ptrMask != nil {
 				c.importPtrMasks[funcIdx] = ptrMask
 			}
-			// Map "heap.alloc" → "__vertex_memory_heap_alloc"
 			sym := "__vertex_memory_" + strings.ReplaceAll(realName, ".", "_")
 			c.importNames = append(c.importNames, sym)
 			c.obj.Symbols = append(c.obj.Symbols, object.Symbol{Name: sym, Kind: object.SymUndefined})
 			numImportFuncs++
 			continue
 		}
-		// ──────────────────────────────────────────────────────
 
 		switch route.Kind {
 		case platform.SyscallTrampoline:
@@ -241,6 +262,8 @@ func (c *moduleCompiler) compile() error {
 		// Inject the required temporary build context to satisfy the new signature
 		tempCtx := bctx.NewBuildContext(c.m)
 		tempCtx.ImportPtrMasks = c.importPtrMasks
+		tempCtx.ImportHptrMasks = c.importHptrMasks
+		tempCtx.ReturnHptrMasks = c.returnHptrMasks
 
 		funcCode, relocs, err := compileFuncBody(tempCtx, wasmIdx, c.inlinedImports)
 		if err != nil {
@@ -329,19 +352,18 @@ func (c *moduleCompiler) generateCallbackTrampolines(numImportFuncs int) {
 		targetOff := c.funcOff[localIdx]
 		trampolineOff := len(c.code)
 
-		// lea r15, [rip + __wasm_data_base]
-		c.code = append(c.code, 0x4C, 0x8D, 0x3D)
+		// mov r15, [rip + __wasm_mem_base]
+		// Loads the wasm base directly; no add-65536 needed since __wasm_mem_base
+		// already points to wasm byte 0 (the mmap'd region base).
+		c.code = append(c.code, 0x4C, 0x8B, 0x3D)
 		c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
 			Offset: trampolineOff + 3,
-			Symbol: "__wasm_data_base",
+			Symbol: "__wasm_mem_base",
 			Kind:   object.RelocRel32,
 		})
 		c.code = asm.Append32LE(c.code, 0)
 
-		// add r15, 65536
-		c.code = append(c.code, 0x49, 0x81, 0xC7)
-		c.code = asm.Append32LE(c.code, 65536)
-
+		// Convert incoming native pointers back to wasm offsets (sub reg, r15).
 		nParams := len(ft.Params)
 		if nParams > 6 {
 			nParams = 6
@@ -352,6 +374,7 @@ func (c *moduleCompiler) generateCallbackTrampolines(numImportFuncs int) {
 			}
 		}
 
+		// jmp to the target wasm function body.
 		c.code = append(c.code, 0xE9)
 		rel := int32(targetOff - (len(c.code) + 4))
 		c.code = asm.Append32LE(c.code, uint32(rel))
@@ -370,9 +393,40 @@ func (c *moduleCompiler) generateCallbackTrampolines(numImportFuncs int) {
 func (c *moduleCompiler) applyRelocs(numImportFuncs int) error {
 	for _, r := range c.relocs {
 		if r.funcIdx == -1 {
+			// R15 load → __wasm_mem_base
 			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
-				Symbol: "__wasm_data_base",
+				Symbol: "__wasm_mem_base",
+				Kind:   object.RelocRel32,
+			})
+			continue
+		}
+
+		if r.funcIdx == -2 {
+			// Lazy-init call → __vertex_memory_init
+			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
+				Offset: r.codeOff,
+				Symbol: "__vertex_memory_init",
+				Kind:   object.RelocRel32,
+			})
+			continue
+		}
+
+		if r.funcIdx == -3 {
+			// Handle Table Load → __vertex_handle_table
+			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
+				Offset: r.codeOff,
+				Symbol: "__vertex_handle_table",
+				Kind:   object.RelocRel32,
+			})
+			continue
+		}
+
+		if r.funcIdx == -4 {
+			// Handle Count Load (atomic bump) → __vertex_handle_count
+			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
+				Offset: r.codeOff,
+				Symbol: "__vertex_handle_count",
 				Kind:   object.RelocRel32,
 			})
 			continue

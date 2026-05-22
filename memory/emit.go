@@ -11,7 +11,19 @@ func Emit(ctx *context.BuildContext) error {
 	e.dataLabel("__vertex_alloc_state")
 	e.dataZero(StateSize)
 
-	// Init stub — called lazily on the first allocation.
+	// Native base address of the wasm address space (= R15 at runtime).
+	// Written by __vertex_memory_init; read by every compiled function prologue.
+	// Zero until the first wasm function runs and triggers lazy init.
+	e.dataLabel("__wasm_mem_base")
+	e.dataZero(8)
+
+	// Number of bytes to copy from the .data static region into the freshly
+	// mmap'd wasm address space during init.  Written by the x86_64 backend's
+	// emitDataSegments after it knows the exact data-segment footprint.
+	e.dataLabel("__wasm_static_bytes")
+	e.dataZero(4)
+
+	// Init stub — sets up the wasm address space and heap/arena on first call.
 	emitInit(e)
 
 	// Heap stubs.
@@ -35,8 +47,6 @@ func Emit(ctx *context.BuildContext) error {
 	emitArenaPop(e)
 	emitArenaAlloc(e)
 
-	// Flush all accumulated code, data, symbols, and relocs into the shared obj
 	e.flush()
-
 	return nil
 }

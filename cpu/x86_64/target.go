@@ -35,6 +35,19 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 	//    generating "__func_N" relocs against symbols that were never defined.
 	inlined, importNames, numImports := t.buildImportInfo(ctx)
 
+	// ── FIX: Explicitly register external imports as Undefined Symbols ──
+	// This ensures the linker knows these are external dependencies, triggering
+	// buildDynamic() to generate the necessary PLT/GOT stubs.
+	for _, sym := range importNames {
+		if sym != "" {
+			ctx.Obj.Symbols = append(ctx.Obj.Symbols, object.Symbol{
+				Name: sym,
+				Kind: object.SymUndefined,
+			})
+		}
+	}
+	// ────────────────────────────────────────────────────────────────────
+
 	// 3. Compile each function body, tracking where in ctx.Obj.Code each
 	//    function lands so that local-to-local calls can be patched inline.
 	funcOffsets := make(map[int]int) // wasm function index → byte offset in ctx.Obj.Code
@@ -60,16 +73,38 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 	for _, r := range pending {
 		switch {
 		case r.funcIdx == -1:
-			// Sentinel emitted by the function prologue for the R15 (MemBase)
-			// load.  Always resolves to __wasm_data_base.
+			// R15 load — resolves to __wasm_mem_base (the mmap'd wasm base).
 			ctx.Obj.Relocs = append(ctx.Obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
-				Symbol: "__wasm_data_base",
+				Symbol: "__wasm_mem_base",
+				Kind:   object.RelocRel32,
+			})
+
+		case r.funcIdx == -2:
+			// Lazy-init call — resolves to __vertex_memory_init.
+			ctx.Obj.Relocs = append(ctx.Obj.Relocs, object.Reloc{
+				Offset: r.codeOff,
+				Symbol: "__vertex_memory_init",
+				Kind:   object.RelocRel32,
+			})
+
+		case r.funcIdx == -3:
+			// Handle Table Load — resolves to __vertex_handle_table.
+			ctx.Obj.Relocs = append(ctx.Obj.Relocs, object.Reloc{
+				Offset: r.codeOff,
+				Symbol: "__vertex_handle_table",
+				Kind:   object.RelocRel32,
+			})
+
+		case r.funcIdx == -4:
+			// Handle Count Load — resolves to __vertex_handle_count.
+			ctx.Obj.Relocs = append(ctx.Obj.Relocs, object.Reloc{
+				Offset: r.codeOff,
+				Symbol: "__vertex_handle_count",
 				Kind:   object.RelocRel32,
 			})
 
 		case r.isAbs64:
-			// ref.func: 64-bit absolute address of a function.
 			sym := t.funcSymbolName(ctx, r.funcIdx, numImports, importNames)
 			if sym == "" {
 				continue
@@ -81,9 +116,8 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 			})
 
 		case r.funcIdx < numImports:
-			// Import call.
 			if _, isInlined := inlined[r.funcIdx]; isInlined {
-				continue // syscall was inlined; the E8 placeholder is dead code
+				continue
 			}
 			sym := importNames[r.funcIdx]
 			if sym == "" {
@@ -96,8 +130,6 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 			})
 
 		default:
-			// Local-to-local direct call: patch the 32-bit PC-relative
-			// displacement inline — no linker reloc needed.
 			targetOff, ok := funcOffsets[r.funcIdx]
 			if !ok {
 				return fmt.Errorf("x86_64: call to unknown function index %d", r.funcIdx)
@@ -163,7 +195,7 @@ func (t *Target) buildImportInfo(ctx *context.BuildContext) (map[int]inlinedImpo
 		}
 
 		route := platform.Parse(e.Module)
-		realName, ptrMask := parseImportSig(e.Name)
+		realName, ptrMask, _, _ := parseImportSig(e.Name)
 
 		switch {
 		case e.Module == "memory":
@@ -220,25 +252,13 @@ func (t *Target) funcSymbolName(ctx *context.BuildContext, funcIdx, numImports i
 }
 
 // emitDataSegments sizes ctx.Obj.Data to cover the full linear-memory layout,
-// copies active data segments into it, lays globals into the reserved 64 KiB
-// header, and defines the __wasm_data_base anchor symbol.
-//
-// Idempotent: returns immediately if __wasm_data_base is already present.
-// Additive: grows ctx.Obj.Data rather than overwriting it, so bytes written
-// by memory.Emit or concurrency.Emit before this call are preserved.
-// Bug 2 fix: the original guard (len(ctx.Obj.Data) == 0) caused this function
-// to be skipped when memory.Emit had already written into ctx.Obj.Data, leaving
-// __wasm_data_base undefined and failing every reloc that referenced it.
 func (t *Target) emitDataSegments(ctx *context.BuildContext) error {
-	// Idempotency: if a prior Emit call or the memory/concurrency injector
-	// already defined __wasm_data_base, there is nothing to do.
 	for _, s := range ctx.Obj.Symbols {
 		if s.Name == "__wasm_data_base" {
 			return nil
 		}
 	}
 
-	// Compute the minimum required size of the data buffer.
 	var maxDataSize int32
 	for _, d := range ctx.Module.Datas.Entries {
 		if active, ok := d.Mode.(wasm.DataModeActive); ok {
@@ -264,17 +284,12 @@ func (t *Target) emitDataSegments(ctx *context.BuildContext) error {
 		maxDataSize = minMemSize
 	}
 
-	// Grow (never shrink or clobber) ctx.Obj.Data.
 	if int(maxDataSize) > len(ctx.Obj.Data) {
 		grown := make([]byte, maxDataSize)
-		copy(grown, ctx.Obj.Data) // preserve anything memory.Emit wrote
+		copy(grown, ctx.Obj.Data)
 		ctx.Obj.Data = grown
 	}
 
-	// Copy active data segments into the buffer.
-	// Each segment lives at (wasm offset + 65536) because the first 64 KiB
-	// of the native data section is reserved for the global-variable slots
-	// and the shadow stack.
 	for _, d := range ctx.Module.Datas.Entries {
 		if active, ok := d.Mode.(wasm.DataModeActive); ok {
 			off, _ := evalConstExprI32(active.Offset)
@@ -285,8 +300,6 @@ func (t *Target) emitDataSegments(ctx *context.BuildContext) error {
 		}
 	}
 
-	// Lay global initial values into the reserved header (slots at
-	// 65536 - 8*(idx+1), growing downward from the 64 KiB boundary).
 	for idx, g := range ctx.Module.Globals.Entries {
 		slot := 65536 - 8*(idx+1)
 		if slot < 0 || slot+8 > len(ctx.Obj.Data) {
@@ -309,15 +322,68 @@ func (t *Target) emitDataSegments(ctx *context.BuildContext) error {
 		}
 	}
 
-	// Define the anchor symbol.  All per-function prologues emit a
-	// RelocRel32 against this name so the linker can fill in the
-	//   lea r15, [rip + __wasm_data_base]
-	// displacement at link time.
 	ctx.Obj.Symbols = append(ctx.Obj.Symbols, object.Symbol{
 		Name:    "__wasm_data_base",
 		Kind:    object.SymDefined,
 		Section: object.SymSecData,
 		Offset:  0,
 	})
+
+	// ── Publish static data size for __vertex_memory_init ─────────────────────
+	// Compute the maximum wasm byte offset covered by active data segments; this
+	// is the exact number of bytes emitInit needs to rep-movsb from .data into
+	// the freshly mmap'd wasm address space.
+	var staticBytes uint32
+	for _, d := range ctx.Module.Datas.Entries {
+		if active, ok := d.Mode.(wasm.DataModeActive); ok {
+			off, _ := evalConstExprI32(active.Offset)
+			if off >= 0 {
+				end := uint32(off) + uint32(len(d.Data))
+				if end > staticBytes {
+					staticBytes = end
+				}
+			}
+		}
+	}
+	// Find the __wasm_static_bytes slot (defined by memory.Emit) and write the
+	// value directly into ctx.Obj.Data now that we know the final size.
+	for _, sym := range ctx.Obj.Symbols {
+		if sym.Name == "__wasm_static_bytes" && sym.Section == object.SymSecData {
+			if int(sym.Offset)+4 <= len(ctx.Obj.Data) {
+				binary.LittleEndian.PutUint32(ctx.Obj.Data[sym.Offset:], staticBytes)
+			}
+			break
+		}
+	}
+
+	// ── NEW: Inject the Global Handle Table ───────────────────────────────────
+	// 64 KB table (8,192 slots) + 8-byte atomic bump counter
+	hasHandleTable := false
+	for _, s := range ctx.Obj.Symbols {
+		if s.Name == "__vertex_handle_table" {
+			hasHandleTable = true
+			break
+		}
+	}
+	if !hasHandleTable {
+		handleTableOff := len(ctx.Obj.Data)
+		ctx.Obj.Data = append(ctx.Obj.Data, make([]byte, 8192*8+8)...)
+
+		ctx.Obj.Symbols = append(ctx.Obj.Symbols, object.Symbol{
+			Name:    "__vertex_handle_table",
+			Kind:    object.SymDefined,
+			Section: object.SymSecData,
+			Offset:  handleTableOff,
+		})
+		ctx.Obj.Symbols = append(ctx.Obj.Symbols, object.Symbol{
+			Name:    "__vertex_handle_count",
+			Kind:    object.SymDefined,
+			Section: object.SymSecData,
+			Offset:  handleTableOff + 8192*8,
+		})
+		// Initialize the bump counter to 1 (so handle index 0 acts as a safe NULL)
+		binary.LittleEndian.PutUint32(ctx.Obj.Data[handleTableOff+8192*8:], 1)
+	}
+
 	return nil
 }

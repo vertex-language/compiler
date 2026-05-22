@@ -16,6 +16,14 @@ type BuildContext struct {
 	// e.g., "write@i32.ptr.i32" -> [false, true, false]
 	ImportPtrMasks map[int][]bool
 
+	// ImportHptrMasks maps an import to opaque native handle parameters.
+	// e.g., "fwrite@ptr.i64.i64.hptr" -> [false, false, false, true]
+	ImportHptrMasks map[int][]bool
+
+	// ReturnHptrMasks flags if an import returns a native handle to be intercepted.
+	// e.g., "fopen@ptr.ptr:hptr" -> true
+	ReturnHptrMasks map[int]bool
+
 	// KernelParams maps a routed Wasm function index to its explicit parameter types.
 	// e.g., "@cuda:ptr.ptr.i32" -> ["ptr", "ptr", "i32"]
 	KernelParams map[int][]string
@@ -41,6 +49,8 @@ func NewBuildContext(m *wasm.Module) *BuildContext {
 		Module:          m,
 		Obj:             &object.WasmObj{},
 		ImportPtrMasks:  make(map[int][]bool),
+		ImportHptrMasks: make(map[int][]bool),
+		ReturnHptrMasks: make(map[int]bool),
 		KernelParams:    make(map[int][]string),
 		ConcurrentFuncs: make(map[int]string),
 	}

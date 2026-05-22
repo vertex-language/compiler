@@ -22,7 +22,7 @@ func Analyze(ctx *context.BuildContext, defaultArch string) (RoutingTable, error
 	}
 	routes[defaultArch] = cpuFuncs
 
-	// 2. Parse Import Signatures for Pointer Masks and Memory
+	// 2. Parse Import Signatures for Pointer Masks, Handles, and Memory
 	funcIdx := 0
 	for _, imp := range ctx.Module.Imports.Entries {
 		if imp.Kind != wasm.ImportFunc {
@@ -36,14 +36,28 @@ func Analyze(ctx *context.BuildContext, defaultArch string) (RoutingTable, error
 
 		parts := strings.Split(imp.Name, "@")
 		if len(parts) == 2 {
-			types := strings.Split(parts[1], ".")
-			mask := make([]bool, len(types))
-			for i, t := range types {
-				if t == "ptr" {
-					mask[i] = true
+			sigParts := strings.Split(parts[1], ":")
+			
+			// Parse parameters
+			if sigParts[0] != "" {
+				types := strings.Split(sigParts[0], ".")
+				pMask := make([]bool, len(types))
+				hMask := make([]bool, len(types))
+				for i, t := range types {
+					if t == "ptr" {
+						pMask[i] = true
+					} else if t == "hptr" {
+						hMask[i] = true
+					}
 				}
+				ctx.ImportPtrMasks[funcIdx] = pMask
+				ctx.ImportHptrMasks[funcIdx] = hMask
 			}
-			ctx.ImportPtrMasks[funcIdx] = mask
+
+			// Parse returns
+			if len(sigParts) == 2 && sigParts[1] == "hptr" {
+				ctx.ReturnHptrMasks[funcIdx] = true
+			}
 		}
 		funcIdx++
 	}

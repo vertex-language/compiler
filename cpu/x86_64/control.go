@@ -126,9 +126,14 @@ func (fc *funcCompiler) emitCall(funcIdx int) error {
 	if isImport {
 		// Pointer translation: @ sig parsed by driver; mask accessed via context.
 		ptrMask := fc.ctx.ImportPtrMasks[funcIdx]
+		hptrMask := fc.ctx.ImportHptrMasks[funcIdx]
+
 		for i := 0; i < bound; i++ {
 			if i < len(ptrMask) && ptrMask[i] {
 				fc.emitSafePointerTranslate(ArgRegs[i])
+			} else if i < len(hptrMask) && hptrMask[i] {
+				// Translate the wasm 32-bit handle index to the true 64-bit native pointer
+				fc.emitHandleResolve(ArgRegs[i])
 			}
 		}
 
@@ -153,6 +158,11 @@ func (fc *funcCompiler) emitCall(funcIdx int) error {
 	}
 
 	if len(ft.Results) > 0 {
+		// If the native function returned a handle (like FILE*), register it
+		// securely in the backend table before passing the 32-bit index to wasm.
+		if isImport && fc.ctx.ReturnHptrMasks[funcIdx] {
+			fc.emitHandleRegister()
+		}
 		fc.emitPushR(RAX)
 	}
 	return nil
@@ -160,4 +170,65 @@ func (fc *funcCompiler) emitCall(funcIdx int) error {
 
 func (fc *funcCompiler) emitCallIndirect(typeIdx uint32) error {
 	return fmt.Errorf("call_indirect not yet supported")
+}
+
+// ── Handle Table Assembly Macros ──────────────────────────────────────────────
+
+// emitHandleResolve transforms a 32-bit wasm handle inside `targetReg` into
+// the true 64-bit native pointer by looking it up in the Handle Table.
+func (fc *funcCompiler) emitHandleResolve(targetReg int) {
+	// 1. Zero-extend the 32-bit wasm handle index into RAX
+	// mov eax, targetReg32
+	rex1 := byte(0x40)
+	if targetReg >= 8 {
+		rex1 |= 0x01 // B bit for source
+	}
+	if rex1 != 0x40 {
+		fc.Emit(rex1)
+	}
+	modrm1 := byte(0xC0 | (targetReg & 7)) // src=targetReg, dst=RAX
+	fc.Emit(0x89, modrm1)
+
+	// 2. Multiply handle index by 8 (pointer size)
+	fc.Emit(0x48, 0xC1, 0xE0, 0x03) // shl rax, 3
+
+	// 3. Add the Handle Table base address
+	fc.Emit(0x48, 0x8D, 0x0D) // lea rcx, [rip + __vertex_handle_table]
+	fc.relocs = append(fc.relocs, funcReloc{codeOff: fc.Pos(), funcIdx: -3})
+	fc.Emit(0, 0, 0, 0)
+	fc.Emit(0x48, 0x01, 0xC8) // add rax, rcx
+
+	// 4. Load the 64-bit native pointer out of the table and into targetReg
+	// mov targetReg64, [rax]
+	rex2 := byte(0x48)
+	if targetReg >= 8 {
+		rex2 |= 0x04 // R bit for dst
+	}
+	modrm2 := byte(0x00 | ((targetReg & 7) << 3) | 0) // src=[RAX], dst=targetReg
+	fc.Emit(rex2, 0x8B, modrm2)
+}
+
+// emitHandleRegister catches a native 64-bit pointer returned in RAX, stores
+// it securely in the Handle Table, and returns the 32-bit index in RAX for wasm.
+func (fc *funcCompiler) emitHandleRegister() {
+	fc.Emit(0x50) // push rax (safeguard the native pointer)
+
+	// 1. Thread-safe bump allocate a new handle index via atomic XADD
+	fc.Emit(0x48, 0x8D, 0x0D) // lea rcx, [rip + __vertex_handle_count]
+	fc.relocs = append(fc.relocs, funcReloc{codeOff: fc.Pos(), funcIdx: -4})
+	fc.Emit(0, 0, 0, 0)
+
+	fc.Emit(0x41, 0xB8, 1, 0, 0, 0)       // mov r8d, 1
+	fc.Emit(0xF0, 0x44, 0x0F, 0xC1, 0x01) // lock xadd [rcx], r8d (old count -> r8d)
+
+	// 2. Store the native pointer in the table
+	fc.Emit(0x48, 0x8D, 0x0D) // lea rcx, [rip + __vertex_handle_table]
+	fc.relocs = append(fc.relocs, funcReloc{codeOff: fc.Pos(), funcIdx: -3})
+	fc.Emit(0, 0, 0, 0)
+
+	fc.Emit(0x58)                   // pop rax (restore native pointer)
+	fc.Emit(0x4A, 0x89, 0x04, 0xC1) // mov [rcx + r8*8], rax (store in table)
+
+	// 3. Return the 32-bit handle index to wasm
+	fc.Emit(0x44, 0x89, 0xC0) // mov eax, r8d
 }

@@ -100,7 +100,9 @@ func (fc *funcCompiler) emitPrologue() {
 	}
 
 	bound := nParams
-	if bound > 6 { bound = 6 }
+	if bound > 6 {
+		bound = 6
+	}
 	for i := 0; i < bound; i++ {
 		fc.StoreLocal64(i, ArgRegs[i])
 	}
@@ -112,14 +114,55 @@ func (fc *funcCompiler) emitPrologue() {
 		}
 	}
 
-	fc.Emit(0x4C, 0x8D, 0x3D) // lea r15, [rip + ???]
+	// ── Load R15 (wasm linear-memory base) from __wasm_mem_base ──────────────
+	//
+	// On the first ever wasm function invocation __wasm_mem_base is zero;
+	// we call __vertex_memory_init to allocate the wasm address space and
+	// publish the base.  All subsequent calls take the fast path (jnz).
+	//
+	// R12 is borrowed as an RSP-alignment scratch: it is callee-saved so the
+	// caller's value is on the stack; __vertex_memory_init saves/restores it
+	// in its own prologue, and we save/restore the original value with
+	// push/pop around the alignment window.
+
+	// mov r15, [rip + __wasm_mem_base]
+	fc.Emit(0x4C, 0x8B, 0x3D)
 	fc.relocs = append(fc.relocs, funcReloc{
 		codeOff: fc.Pos(),
-		funcIdx: -1, // sentinel → __wasm_data_base
+		funcIdx: -1, // sentinel → __wasm_mem_base
 	})
 	fc.Emit(0, 0, 0, 0)
-	fc.Emit(0x49, 0x81, 0xC7) // add r15, imm32
-	fc.Emit32(65536)
+
+	// test r15, r15
+	fc.Emit(0x4D, 0x85, 0xFF)
+	// jnz r15_ready
+	fc.Emit(0x0F, 0x85)
+	patchReady := fc.ZeroRel32()
+
+	// R15 is zero: bootstrap the wasm address space.
+	fc.Push(R12)                                 // save caller's r12
+	fc.Emit(0x49, 0x89, 0xE4)                   // mov r12, rsp
+	fc.Emit(0x48, 0x83, 0xE4, 0xF0)             // and rsp, -16  (SysV alignment)
+	fc.Emit(0x31, 0xC0)                          // xor eax, eax  (no vector regs)
+	fc.Emit(0xE8)                                // call __vertex_memory_init
+	fc.relocs = append(fc.relocs, funcReloc{
+		codeOff: fc.Pos(),
+		funcIdx: -2, // sentinel → __vertex_memory_init
+	})
+	fc.Emit(0, 0, 0, 0)
+	fc.Emit(0x4C, 0x89, 0xE4)                   // mov rsp, r12
+	fc.Pop(R12)                                  // restore caller's r12
+
+	// Reload R15 now that __wasm_mem_base is populated.
+	// mov r15, [rip + __wasm_mem_base]
+	fc.Emit(0x4C, 0x8B, 0x3D)
+	fc.relocs = append(fc.relocs, funcReloc{
+		codeOff: fc.Pos(),
+		funcIdx: -1,
+	})
+	fc.Emit(0, 0, 0, 0)
+
+	fc.Patch32(patchReady, fc.Pos())
 }
 
 func (fc *funcCompiler) emitEpilogue() {

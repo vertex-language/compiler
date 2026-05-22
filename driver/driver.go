@@ -31,20 +31,20 @@ func (d *Driver) Register(t Target) {
 func (d *Driver) Compile(m *wasm.Module, defaultArch string) (*object.WasmObj, error) {
 	ctx := context.NewBuildContext(m)
 
-	// 1. Discover hints and build the routing table
 	routes, err := Analyze(ctx, defaultArch)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Inject platform stubs (Memory and Concurrency)
-	if ctx.NeedsMemory {
-		if defaultArch != "amd64" {
-			return nil, fmt.Errorf("driver: memory allocator not yet ported to %s", defaultArch)
-		}
-		if err := memory.Emit(ctx); err != nil {
-			return nil, fmt.Errorf("driver: failed to emit memory stubs: %w", err)
-		}
+	// Always emit allocator stubs so that __vertex_memory_init and
+	// __wasm_mem_base exist in every binary.  The mmap is lazy (triggered by
+	// the first wasm function call) so binaries without heap imports pay no
+	// runtime cost beyond a single pointer load per prologue.
+	if defaultArch != "amd64" {
+		return nil, fmt.Errorf("driver: memory allocator not yet ported to %s", defaultArch)
+	}
+	if err := memory.Emit(ctx); err != nil {
+		return nil, fmt.Errorf("driver: failed to emit memory stubs: %w", err)
 	}
 
 	if ctx.NeedsAsync || ctx.NeedsThread || ctx.NeedsProcess {
@@ -56,18 +56,14 @@ func (d *Driver) Compile(m *wasm.Module, defaultArch string) (*object.WasmObj, e
 		}
 	}
 
-	// 3. Dispatch to the registered targets
 	for targetID, funcs := range routes {
 		if len(funcs) == 0 {
-			continue // Skip idle targets
+			continue
 		}
-
 		target, exists := d.targets[targetID]
 		if !exists {
 			return nil, fmt.Errorf("driver: unsupported target backend %q", targetID)
 		}
-
-		// Targets write directly to ctx.Obj
 		if err := target.Emit(ctx, funcs); err != nil {
 			return nil, fmt.Errorf("driver: %s compilation failed: %w", targetID, err)
 		}

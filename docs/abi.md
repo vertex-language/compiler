@@ -6,13 +6,15 @@ A complete reference for all import namespaces, export conventions, and callable
 
 ## Import Signature Syntax
 
-All imports that pass pointers carry a `@`-suffix signature on the function name.
+All imports that pass pointers or handles carry a `@`-suffix signature on the function name. To capture a native handle returned by the host, use the optional `:<type>` suffix.
 
 ```wasm
 ;; General syntax structure
-(import "<module>" "<name>@<type>.<type>.<type>..." (func ...))
+(import "<module>" "<name>@<param_type>.<param_type>...:<return_type>" (func ...))
 
 ```
+
+### Type Tokens
 
 | Token | Meaning |
 | --- | --- |
@@ -20,13 +22,20 @@ All imports that pass pointers carry a `@`-suffix signature on the function name
 | `i64` | 64-bit integer — passed as-is |
 | `f32` | 32-bit float — passed as-is |
 | `f64` | 64-bit float — passed as-is |
-| `ptr` | Linear-memory i32 offset — auto-translated to native VA before call |
+| `ptr` | Linear-memory i32 offset — auto-translated to native VA (`+ r15`) before call |
+| `hptr` | Opaque native handle index — auto-resolved via Handle Table before call, or registered on return |
 
-Functions with no pointer parameters need no `@` suffix.
+Functions with no pointer or handle parameters/returns need no `@` suffix.
 
 ```wasm
 ;; fd=i32, buf=ptr, count=i32
 (import "linux:kernel/syscalls" "write@i32.ptr.i32" (func (param i32 i32 i32) (result i32)))
+
+;; fopen returns a native FILE*, intercepted and returned to wasm as an hptr (i32)
+(import "libc" "fopen@ptr.ptr:hptr" (func (param i32 i32) (result i32)))
+
+;; fwrite receives the hptr, resolves it to the real FILE*, and passes it to the C library
+(import "libc" "fwrite@ptr.i64.i64.hptr" (func (param i32 i64 i64 i32) (result i64)))
 
 ;; no pointer params, no suffix needed
 (import "linux:kernel/syscalls" "getpid" (func (result i32)))
@@ -86,8 +95,8 @@ Any syscall from the Linux 6.x amd64/arm64 table is valid. `ptr` params have `R1
 Emits an IAT entry. Same `@`-suffix signature convention.
 
 ```wasm
-(import "windows:kernel32" "WriteFile@ptr.i32.ptr.ptr.ptr" (func (param i32 i32 i32 i32 i32) (result i32)))
-(import "windows:kernel32" "ReadFile@ptr.ptr.i32.ptr.ptr" (func (param i32 i32 i32 i32 i32) (result i32)))
+(import "windows:kernel32" "WriteFile@hptr.ptr.i32.ptr.ptr" (func (param i32 i32 i32 i32 i32) (result i32)))
+(import "windows:kernel32" "ReadFile@hptr.ptr.i32.ptr.ptr" (func (param i32 i32 i32 i32 i32) (result i32)))
 
 ```
 
@@ -104,12 +113,17 @@ Emits an `LC_LOAD_DYLIB` stub.
 
 ---
 
-### `c` — Cross-platform libc
+### `libc` / `c` — Cross-platform libc
 
-The `lib` prefix is added automatically on Linux/macOS.
+The `lib` prefix is added automatically on Linux/macOS. File I/O utilizes the `hptr` token to safely encapsulate 64-bit `FILE*` native pointers inside the 32-bit wasm sandbox.
 
 ```wasm
-(import "c" "printf@ptr.i32" (func (param i32 i32) (result i32)))
+(import "libc" "fopen@ptr.ptr:hptr" (func (param i32 i32) (result i32)))
+(import "libc" "fwrite@ptr.i64.i64.hptr" (func (param i32 i64 i64 i32) (result i64)))
+(import "libc" "fread@ptr.i64.i64.hptr" (func (param i32 i64 i64 i32) (result i64)))
+(import "libc" "fclose@hptr" (func (param i32) (result i32)))
+
+(import "c" "printf@ptr.ptr" (func (param i32 i32) (result i32)))
 (import "c" "strlen@ptr" (func (param i32) (result i32)))
 
 ```
@@ -124,6 +138,7 @@ Use the bare library name as the module field.
 
 ```wasm
 (import "sdl2" "SDL_Init@i32" (func (param i32) (result i32)))
+(import "sdl2" "SDL_CreateWindow@ptr.i32.i32.i32.i32.i32:hptr" (func (param i32 i32 i32 i32 i32 i32) (result i32)))
 
 ```
 
