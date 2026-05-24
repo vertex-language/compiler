@@ -1,115 +1,100 @@
 package driver
 
 import (
-	"strings"
-
+	"github.com/vertex-language/compiler/abi"
 	"github.com/vertex-language/compiler/context"
 	"github.com/vertex-language/compiler/wasm"
 )
 
-// RoutingTable groups Wasm function indices by their destination backend ID.
+// RoutingTable groups wasm function indices by their destination backend ID.
 type RoutingTable map[string][]int
 
-// Analyze processes the ABI strings and populates the shared context.
+// Analyze processes all import and export ABI strings, populates the shared
+// BuildContext with pointer/handle masks and concurrency flags, and returns
+// a RoutingTable that maps each function to its backend.
 func Analyze(ctx *context.BuildContext, defaultArch string) (RoutingTable, error) {
 	routes := make(RoutingTable)
 
-	// 1. Initial State: Assign all local functions to the default CPU target.
-	var cpuFuncs []int
+	// 1. All local functions start on the default CPU target.
 	numImports := int(ctx.Module.Imports.NumFuncs())
+	cpuFuncs := make([]int, 0, ctx.Module.Functions.Len())
 	for i := numImports; i < ctx.Module.Functions.Len()+numImports; i++ {
 		cpuFuncs = append(cpuFuncs, i)
 	}
 	routes[defaultArch] = cpuFuncs
 
-	// 2. Parse Import Signatures for Pointer Masks, Handles, and Memory
+	// 2. Parse import signatures: populate ptr/hptr masks and detect memory.
 	funcIdx := 0
 	for _, imp := range ctx.Module.Imports.Entries {
 		if imp.Kind != wasm.ImportFunc {
 			continue
 		}
 
-		// Detect memory imports
-		if imp.Module == "memory" {
+		route := abi.Parse(imp.Module)
+		if route.Kind == abi.VertexMemory {
 			ctx.NeedsMemory = true
 		}
 
-		parts := strings.Split(imp.Name, "@")
-		if len(parts) == 2 {
-			sigParts := strings.Split(parts[1], ":")
-			
-			// Parse parameters
-			if sigParts[0] != "" {
-				types := strings.Split(sigParts[0], ".")
-				pMask := make([]bool, len(types))
-				hMask := make([]bool, len(types))
-				for i, t := range types {
-					if t == "ptr" {
-						pMask[i] = true
-					} else if t == "hptr" {
-						hMask[i] = true
-					}
-				}
-				ctx.ImportPtrMasks[funcIdx] = pMask
-				ctx.ImportHptrMasks[funcIdx] = hMask
-			}
-
-			// Parse returns
-			if len(sigParts) == 2 && sigParts[1] == "hptr" {
-				ctx.ReturnHptrMasks[funcIdx] = true
-			}
+		sig := abi.ParseSig(imp.Name)
+		if sig.PtrMask != nil {
+			ctx.ImportPtrMasks[funcIdx] = sig.PtrMask
 		}
+		if sig.HptrMask != nil {
+			ctx.ImportHptrMasks[funcIdx] = sig.HptrMask
+		}
+		if sig.RetHptr {
+			ctx.ReturnHptrMasks[funcIdx] = true
+		}
+
 		funcIdx++
 	}
 
-	// 3. Parse Export Signatures for GPU Routing and Concurrency Detection
+	// 3. Parse export suffixes: route GPU kernels and detect concurrency.
 	for _, exp := range ctx.Module.Exports.Entries {
 		if exp.Kind != wasm.ExportFunc {
 			continue
 		}
 
-		parts := strings.Split(exp.Name, "@")
-		if len(parts) != 2 {
-			continue // Standard export, stays on default CPU
+		export := abi.ParseExport(exp.Name)
+
+		if export.Kind == abi.ExportCPU {
+			continue // stays on the default CPU target
 		}
 
-		targetAndTypes := strings.Split(parts[1], ":")
-		target := targetAndTypes[0]
-
-		if len(targetAndTypes) == 2 {
-			ctx.KernelParams[int(exp.Idx)] = strings.Split(targetAndTypes[1], ".")
+		if export.Params != nil {
+			ctx.KernelParams[int(exp.Idx)] = export.Params
 		}
 
-		// Detect concurrency models or route to GPU
-		switch target {
-		case "async":
-			ctx.NeedsAsync = true
-			ctx.ConcurrentFuncs[int(exp.Idx)] = "async"
-			// Stays in the default CPU bucket (compiled under __vertex_fn_X)
-		case "thread":
-			ctx.NeedsThread = true
-			ctx.ConcurrentFuncs[int(exp.Idx)] = "thread"
-			// Stays in the default CPU bucket
-		case "process":
-			ctx.NeedsProcess = true
-			ctx.ConcurrentFuncs[int(exp.Idx)] = "process"
-			// Stays in the default CPU bucket
-		default:
-			// Route to GPU: Move function out of CPU bucket and into target bucket
+		switch {
+		case export.Kind.IsGPU():
+			// Move the function out of the CPU bucket into its GPU bucket.
+			target := export.Kind.String() // "cuda", "msl", or "vulkan"
 			routes[target] = append(routes[target], int(exp.Idx))
 			routes[defaultArch] = remove(routes[defaultArch], int(exp.Idx))
+
+		case export.Kind == abi.ExportAsync:
+			ctx.NeedsAsync = true
+			ctx.ConcurrentFuncs[int(exp.Idx)] = "async"
+			// Stays in the CPU bucket; compiled under __vertex_fn_X.
+
+		case export.Kind == abi.ExportThread:
+			ctx.NeedsThread = true
+			ctx.ConcurrentFuncs[int(exp.Idx)] = "thread"
+
+		case export.Kind == abi.ExportProcess:
+			ctx.NeedsProcess = true
+			ctx.ConcurrentFuncs[int(exp.Idx)] = "process"
 		}
 	}
 
-	// Note: Name custom section parsing for internal kernels would go here,
-	// following the exact same logic as the exports above.
+	// Note: name custom-section parsing for non-exported GPU kernels would
+	// follow identical logic to the export loop above.
 
 	return routes, nil
 }
 
-// remove is a helper to filter out an element from a slice.
 func remove(s []int, val int) []int {
-	var res []int
+	res := s[:0]
 	for _, v := range s {
 		if v != val {
 			res = append(res, v)

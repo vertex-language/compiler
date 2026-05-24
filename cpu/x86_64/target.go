@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/vertex-language/compiler/abi"
+	linuxabi "github.com/vertex-language/compiler/abi/linux"
 	"github.com/vertex-language/compiler/context"
 	"github.com/vertex-language/compiler/cpu/x86_64/asm"
 	"github.com/vertex-language/compiler/object"
-	"github.com/vertex-language/compiler/platform"
-	linuxplatform "github.com/vertex-language/compiler/platform/linux"
 	"github.com/vertex-language/compiler/wasm"
 )
 
@@ -19,25 +19,21 @@ type Target struct{ QualifiedSymbols bool }
 func (t *Target) ID() string { return "amd64" }
 
 func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
-	// 1. Ensure the data buffer is sized, data segments are copied in, globals
-	//    are laid out, and __wasm_data_base is defined.  Must run before any
-	//    call to compileFuncBody so that prologues can emit relocs against it.
-	//    Also must run before memory/concurrency stubs write into ctx.Obj.Data,
-	//    which is why emitDataSegments is idempotent and grows (not overwrites).
+	// 1. Size the data buffer, copy active data segments, lay out globals,
+	//    and define __wasm_data_base. Must run before compileFuncBody so
+	//    that prologues can emit relocs against it.
 	if err := t.emitDataSegments(ctx); err != nil {
 		return err
 	}
 
-	// 2. Build the inlinedImports map (syscalls → inline) and the importNames
-	//    slice (all other imports → linker symbol name).
-	//    Bug 1 fix: the original code passed nil here, so syscall imports were
-	//    never resolved as inline and fell through to the native call path,
-	//    generating "__func_N" relocs against symbols that were never defined.
-	inlined, importNames, numImports := t.buildImportInfo(ctx)
+	// 2. Build the inlined-syscall map and the import symbol-name slice.
+	inlined, importNames, numImports, err := t.buildImportInfo(ctx)
+	if err != nil {
+		return err
+	}
 
-	// ── FIX: Explicitly register external imports as Undefined Symbols ──
-	// This ensures the linker knows these are external dependencies, triggering
-	// buildDynamic() to generate the necessary PLT/GOT stubs.
+	// 3. Register every non-inlined import as an undefined symbol so the
+	//    linker knows to generate PLT/GOT stubs for them.
 	for _, sym := range importNames {
 		if sym != "" {
 			ctx.Obj.Symbols = append(ctx.Obj.Symbols, object.Symbol{
@@ -46,12 +42,11 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 			})
 		}
 	}
-	// ────────────────────────────────────────────────────────────────────
 
-	// 3. Compile each function body, tracking where in ctx.Obj.Code each
-	//    function lands so that local-to-local calls can be patched inline.
-	funcOffsets := make(map[int]int) // wasm function index → byte offset in ctx.Obj.Code
-	var pending []funcReloc          // all relocs, with codeOff adjusted to global position
+	// 4. Compile each function body, recording its start offset so that
+	//    local-to-local calls can be patched inline.
+	funcOffsets := make(map[int]int) // wasm index → byte offset in ctx.Obj.Code
+	var pending []funcReloc
 
 	for _, idx := range funcIndices {
 		codeBase := len(ctx.Obj.Code)
@@ -64,16 +59,16 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 		ctx.Obj.Code = append(ctx.Obj.Code, code...)
 
 		for _, r := range relocs {
-			r.codeOff += codeBase // make offset global within ctx.Obj.Code
+			r.codeOff += codeBase
 			pending = append(pending, r)
 		}
 	}
 
-	// 4. Apply relocs now that all function offsets are known.
+	// 5. Apply all relocs now that every function offset is known.
 	for _, r := range pending {
 		switch {
 		case r.funcIdx == -1:
-			// R15 load — resolves to __wasm_mem_base (the mmap'd wasm base).
+			// R15 prologue load → __wasm_mem_base
 			ctx.Obj.Relocs = append(ctx.Obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
 				Symbol: "__wasm_mem_base",
@@ -81,7 +76,7 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 			})
 
 		case r.funcIdx == -2:
-			// Lazy-init call — resolves to __vertex_memory_init.
+			// Lazy-init call → __vertex_memory_init
 			ctx.Obj.Relocs = append(ctx.Obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
 				Symbol: "__vertex_memory_init",
@@ -89,7 +84,7 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 			})
 
 		case r.funcIdx == -3:
-			// Handle Table Load — resolves to __vertex_handle_table.
+			// Handle Table base → __vertex_handle_table
 			ctx.Obj.Relocs = append(ctx.Obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
 				Symbol: "__vertex_handle_table",
@@ -97,7 +92,7 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 			})
 
 		case r.funcIdx == -4:
-			// Handle Count Load — resolves to __vertex_handle_count.
+			// Handle bump counter → __vertex_handle_count
 			ctx.Obj.Relocs = append(ctx.Obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
 				Symbol: "__vertex_handle_count",
@@ -139,9 +134,8 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 		}
 	}
 
-	// 5. Emit symbols for every compiled function.
-	//    Export names take priority; unexported locals get a __local_func_N name
-	//    so that abs64 ref.func relocs can resolve them via the linker.
+	// 6. Emit symbols for every compiled function. Export names take priority;
+	//    unexported locals get __local_func_N so ref.func abs64 relocs resolve.
 	emittedLocal := make(map[int]bool)
 	for _, e := range ctx.Module.Exports.Entries {
 		if e.Kind != wasm.ExportFunc {
@@ -149,10 +143,11 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 		}
 		off, ok := funcOffsets[int(e.Idx)]
 		if !ok {
-			continue // function was routed to a different backend (e.g. GPU)
+			continue // routed to a different backend (GPU)
 		}
+		export := abi.ParseExport(e.Name)
 		ctx.Obj.Symbols = append(ctx.Obj.Symbols, object.Symbol{
-			Name:    e.Name,
+			Name:    export.Name, // stripped of @-suffix
 			Kind:    object.SymDefined,
 			Section: object.SymSecText,
 			Offset:  off,
@@ -179,12 +174,10 @@ func (t *Target) Emit(ctx *context.BuildContext, funcIndices []int) error {
 }
 
 // buildImportInfo walks the module's import section and returns:
-//   - inlined: map from funcIdx → inlinedImport for syscalls that should be
-//     emitted inline rather than via a call instruction.
-//   - importNames: parallel slice of linker symbol names; empty string for
-//     inlined imports (the reloc is skipped at apply time).
-//   - numImports: total number of imported functions.
-func (t *Target) buildImportInfo(ctx *context.BuildContext) (map[int]inlinedImport, []string, int) {
+//   - inlined:     funcIdx → inlinedImport for syscalls emitted inline
+//   - importNames: linker symbol name per imported function; "" for inlined
+//   - numImports:  total imported function count
+func (t *Target) buildImportInfo(ctx *context.BuildContext) (map[int]inlinedImport, []string, int, error) {
 	inlined := make(map[int]inlinedImport)
 	var importNames []string
 
@@ -194,48 +187,91 @@ func (t *Target) buildImportInfo(ctx *context.BuildContext) (map[int]inlinedImpo
 			continue
 		}
 
-		route := platform.Parse(e.Module)
-		realName, ptrMask, _, _ := parseImportSig(e.Name)
+		route := abi.Parse(e.Module)
+		sig := abi.ParseSig(e.Name)
 
-		switch {
-		case e.Module == "memory":
-			// Resolved by the allocator stubs injected by memory.Emit.
-			// The symbol name mirrors what memory.Emit defines.
-			sym := "__vertex_memory_" + strings.ReplaceAll(realName, ".", "_")
-			importNames = append(importNames, sym)
+		switch route.Kind {
 
-		case route.Kind == platform.SyscallTrampoline:
-			// Emit the syscall inline; record an empty name so the call-site
-			// reloc is skipped cleanly.
-			n, ok := linuxplatform.SyscallNumber(realName, "amd64")
+		case abi.LinuxSyscall:
+			n, ok := linuxabi.SyscallNumber(sig.Name, "amd64")
 			if ok {
 				inlined[funcIdx] = inlinedImport{
 					module:  e.Module,
-					name:    realName,
+					name:    sig.Name,
 					number:  n,
-					ptrMask: ptrMask,
+					ptrMask: sig.PtrMask,
 				}
 			}
-			importNames = append(importNames, "") // reloc will be skipped
+			importNames = append(importNames, "") // inlined; reloc skipped
 
-		case route.Kind == platform.PlatformLib:
-			importNames = append(importNames, e.Module+"::"+realName)
+		case abi.LinuxLib:
+			// Symbol qualified with the full module path so the linker can
+			// distinguish linux/libc::fopen from any other fopen.
+			importNames = append(importNames, e.Module+"::"+sig.Name)
 
-		default: // CrossPlatformLib or any bare shared library
-			sym := realName
+		case abi.VcpkgLib:
+			// lib/* libraries are resolved by the vcpkg-driven link step.
+			// Unqualified by default so the archive's own symbol names match.
+			sym := sig.Name
 			if t.QualifiedSymbols {
-				sym = e.Module + "::" + realName
+				sym = e.Module + "::" + sig.Name
 			}
 			importNames = append(importNames, sym)
+
+		case abi.VertexMemory:
+			// Resolved to __vertex_memory_* stubs injected by memory.Emit.
+			// Dots in allocator sub-names (e.g. "heap.alloc") become underscores.
+			sym := "__vertex_memory_" + strings.ReplaceAll(sig.Name, ".", "_")
+			importNames = append(importNames, sym)
+
+		// ── Not yet implemented ───────────────────────────────────────────────
+
+		case abi.WindowsDLL:
+			return nil, nil, 0, fmt.Errorf(
+				"x86_64: %s::%s — windows/* imports are not valid on this target",
+				e.Module, sig.Name,
+			)
+
+		case abi.DarwinLib:
+			return nil, nil, 0, fmt.Errorf(
+				"x86_64: %s::%s — darwin/* imports are not valid on this target",
+				e.Module, sig.Name,
+			)
+
+		case abi.BIOSService:
+			return nil, nil, 0, fmt.Errorf(
+				"x86_64: %s::%s — hw/bios backend not yet implemented",
+				e.Module, sig.Name,
+			)
+
+		case abi.UEFIService:
+			return nil, nil, 0, fmt.Errorf(
+				"x86_64: %s::%s — hw/uefi backend not yet implemented",
+				e.Module, sig.Name,
+			)
+
+		case abi.GPUIntrinsic:
+			return nil, nil, 0, fmt.Errorf(
+				"x86_64: %s::%s — gpu/* intrinsics are only valid inside "+
+					"@cuda/@msl/@vulkan-exported functions; add the export suffix",
+				e.Module, sig.Name,
+			)
+
+		default:
+			return nil, nil, 0, fmt.Errorf(
+				"x86_64: %s::%s — unrecognised import namespace",
+				e.Module, sig.Name,
+			)
 		}
+
 		funcIdx++
 	}
-	return inlined, importNames, funcIdx
+	return inlined, importNames, funcIdx, nil
 }
 
-// funcSymbolName returns the linker symbol name for funcIdx, used when
-// emitting abs64 ref.func relocs.  For local functions the export name is
-// preferred; unexported functions fall back to __local_func_N.
+// funcSymbolName returns the linker symbol for funcIdx, used when emitting
+// abs64 ref.func relocs. Export name takes priority; unexported functions
+// fall back to __local_func_N.
 func (t *Target) funcSymbolName(ctx *context.BuildContext, funcIdx, numImports int, importNames []string) string {
 	if funcIdx < numImports {
 		if funcIdx < len(importNames) {
@@ -245,13 +281,15 @@ func (t *Target) funcSymbolName(ctx *context.BuildContext, funcIdx, numImports i
 	}
 	for _, e := range ctx.Module.Exports.Entries {
 		if e.Kind == wasm.ExportFunc && int(e.Idx) == funcIdx {
-			return e.Name
+			return abi.ParseExport(e.Name).Name
 		}
 	}
 	return fmt.Sprintf("__local_func_%d", funcIdx-numImports)
 }
 
 // emitDataSegments sizes ctx.Obj.Data to cover the full linear-memory layout,
+// copies active data segments in, lays out globals, and defines
+// __wasm_data_base. Idempotent: a second call is a no-op.
 func (t *Target) emitDataSegments(ctx *context.BuildContext) error {
 	for _, s := range ctx.Obj.Symbols {
 		if s.Name == "__wasm_data_base" {
@@ -329,24 +367,18 @@ func (t *Target) emitDataSegments(ctx *context.BuildContext) error {
 		Offset:  0,
 	})
 
-	// ── Publish static data size for __vertex_memory_init ─────────────────────
-	// Compute the maximum wasm byte offset covered by active data segments; this
-	// is the exact number of bytes emitInit needs to rep-movsb from .data into
-	// the freshly mmap'd wasm address space.
+	// Publish the static data byte count for __vertex_memory_init.
 	var staticBytes uint32
 	for _, d := range ctx.Module.Datas.Entries {
 		if active, ok := d.Mode.(wasm.DataModeActive); ok {
 			off, _ := evalConstExprI32(active.Offset)
 			if off >= 0 {
-				end := uint32(off) + uint32(len(d.Data))
-				if end > staticBytes {
+				if end := uint32(off) + uint32(len(d.Data)); end > staticBytes {
 					staticBytes = end
 				}
 			}
 		}
 	}
-	// Find the __wasm_static_bytes slot (defined by memory.Emit) and write the
-	// value directly into ctx.Obj.Data now that we know the final size.
 	for _, sym := range ctx.Obj.Symbols {
 		if sym.Name == "__wasm_static_bytes" && sym.Section == object.SymSecData {
 			if int(sym.Offset)+4 <= len(ctx.Obj.Data) {
@@ -356,8 +388,7 @@ func (t *Target) emitDataSegments(ctx *context.BuildContext) error {
 		}
 	}
 
-	// ── NEW: Inject the Global Handle Table ───────────────────────────────────
-	// 64 KB table (8,192 slots) + 8-byte atomic bump counter
+	// Inject the global Handle Table (64 KB / 8,192 slots + 8-byte counter).
 	hasHandleTable := false
 	for _, s := range ctx.Obj.Symbols {
 		if s.Name == "__vertex_handle_table" {
@@ -366,23 +397,25 @@ func (t *Target) emitDataSegments(ctx *context.BuildContext) error {
 		}
 	}
 	if !hasHandleTable {
-		handleTableOff := len(ctx.Obj.Data)
+		tableOff := len(ctx.Obj.Data)
 		ctx.Obj.Data = append(ctx.Obj.Data, make([]byte, 8192*8+8)...)
 
-		ctx.Obj.Symbols = append(ctx.Obj.Symbols, object.Symbol{
-			Name:    "__vertex_handle_table",
-			Kind:    object.SymDefined,
-			Section: object.SymSecData,
-			Offset:  handleTableOff,
-		})
-		ctx.Obj.Symbols = append(ctx.Obj.Symbols, object.Symbol{
-			Name:    "__vertex_handle_count",
-			Kind:    object.SymDefined,
-			Section: object.SymSecData,
-			Offset:  handleTableOff + 8192*8,
-		})
-		// Initialize the bump counter to 1 (so handle index 0 acts as a safe NULL)
-		binary.LittleEndian.PutUint32(ctx.Obj.Data[handleTableOff+8192*8:], 1)
+		ctx.Obj.Symbols = append(ctx.Obj.Symbols,
+			object.Symbol{
+				Name:    "__vertex_handle_table",
+				Kind:    object.SymDefined,
+				Section: object.SymSecData,
+				Offset:  tableOff,
+			},
+			object.Symbol{
+				Name:    "__vertex_handle_count",
+				Kind:    object.SymDefined,
+				Section: object.SymSecData,
+				Offset:  tableOff + 8192*8,
+			},
+		)
+		// Bump counter starts at 1; index 0 acts as a safe NULL.
+		binary.LittleEndian.PutUint32(ctx.Obj.Data[tableOff+8192*8:], 1)
 	}
 
 	return nil

@@ -6,12 +6,12 @@ import (
 	"os"
 	"strings"
 
+	"github.com/vertex-language/compiler/abi"
+	linuxabi "github.com/vertex-language/compiler/abi/linux"
 	bctx "github.com/vertex-language/compiler/context"
 	"github.com/vertex-language/compiler/cpu/x86_64/asm"
 	"github.com/vertex-language/compiler/decode"
 	"github.com/vertex-language/compiler/object"
-	"github.com/vertex-language/compiler/platform"
-	linuxplatform "github.com/vertex-language/compiler/platform/linux"
 	"github.com/vertex-language/compiler/wasm"
 )
 
@@ -56,36 +56,6 @@ type moduleCompiler struct {
 	returnHptrMasks map[int]bool
 	inlinedImports  map[int]inlinedImport
 	trampolineSyms  map[int]int
-}
-
-func parseImportSig(name string) (base string, ptrMask []bool, hptrMask []bool, retHptr bool) {
-	idx := strings.IndexByte(name, '@')
-	if idx == -1 {
-		return name, nil, nil, false
-	}
-	base = name[:idx]
-	sig := name[idx+1:]
-	if sig == "" {
-		return base, nil, nil, false
-	}
-
-	// Split parameters from the return type
-	parts := strings.Split(sig, ":")
-	params := parts[0]
-	if len(parts) > 1 && parts[1] == "hptr" {
-		retHptr = true
-	}
-
-	if params != "" {
-		pTokens := strings.Split(params, ".")
-		ptrMask = make([]bool, len(pTokens))
-		hptrMask = make([]bool, len(pTokens))
-		for i, p := range pTokens {
-			ptrMask[i] = (p == "ptr")
-			hptrMask[i] = (p == "hptr")
-		}
-	}
-	return base, ptrMask, hptrMask, retHptr
 }
 
 func (c *moduleCompiler) compile() error {
@@ -196,56 +166,88 @@ func (c *moduleCompiler) compile() error {
 		if e.Kind != wasm.ImportFunc {
 			continue
 		}
-		funcIdx := numImportFuncs
-		route := platform.Parse(e.Module)
-		realName, ptrMask, hptrMask, retHptr := parseImportSig(e.Name)
 
-		if hptrMask != nil {
-			c.importHptrMasks[funcIdx] = hptrMask
+		funcIdx := numImportFuncs
+		route := abi.Parse(e.Module)
+		sig := abi.ParseSig(e.Name)
+
+		if sig.PtrMask != nil {
+			c.importPtrMasks[funcIdx] = sig.PtrMask
 		}
-		if retHptr {
+		if sig.HptrMask != nil {
+			c.importHptrMasks[funcIdx] = sig.HptrMask
+		}
+		if sig.RetHptr {
 			c.returnHptrMasks[funcIdx] = true
 		}
 
-		// Intercept internal Vertex allocator imports
-		if e.Module == "memory" {
-			if ptrMask != nil {
-				c.importPtrMasks[funcIdx] = ptrMask
-			}
-			sym := "__vertex_memory_" + strings.ReplaceAll(realName, ".", "_")
-			c.importNames = append(c.importNames, sym)
-			c.obj.Symbols = append(c.obj.Symbols, object.Symbol{Name: sym, Kind: object.SymUndefined})
-			numImportFuncs++
-			continue
-		}
-
 		switch route.Kind {
-		case platform.SyscallTrampoline:
+
+		case abi.LinuxSyscall:
 			ft := c.m.Types.Entries[e.TypeIdx]
-			if err := c.resolveSyscallImport(funcIdx, e.Module, realName, ptrMask, ft); err != nil {
-				return fmt.Errorf("compile: import %q::%q: %w", e.Module, e.Name, err)
+			if err := c.resolveSyscallImport(funcIdx, e.Module, sig.Name, sig.PtrMask, ft); err != nil {
+				return fmt.Errorf("compile: import %s::%s: %w", e.Module, e.Name, err)
 			}
 			c.importNames = append(c.importNames, "")
 
-		case platform.PlatformLib:
-			if ptrMask != nil {
-				c.importPtrMasks[funcIdx] = ptrMask
-			}
-			sym := e.Module + "::" + realName
+		case abi.LinuxLib:
+			sym := e.Module + "::" + sig.Name
 			c.importNames = append(c.importNames, sym)
 			c.obj.Symbols = append(c.obj.Symbols, object.Symbol{Name: sym, Kind: object.SymUndefined})
 
-		case platform.CrossPlatformLib:
-			if ptrMask != nil {
-				c.importPtrMasks[funcIdx] = ptrMask
-			}
-			sym := realName
+		case abi.VcpkgLib:
+			sym := sig.Name
 			if c.qualifiedSymbols {
-				sym = e.Module + "::" + realName
+				sym = e.Module + "::" + sig.Name
 			}
 			c.importNames = append(c.importNames, sym)
 			c.obj.Symbols = append(c.obj.Symbols, object.Symbol{Name: sym, Kind: object.SymUndefined})
+
+		case abi.VertexMemory:
+			sym := "__vertex_memory_" + strings.ReplaceAll(sig.Name, ".", "_")
+			c.importNames = append(c.importNames, sym)
+			c.obj.Symbols = append(c.obj.Symbols, object.Symbol{Name: sym, Kind: object.SymUndefined})
+
+		// ── Not yet implemented ───────────────────────────────────────────────
+
+		case abi.WindowsDLL:
+			return fmt.Errorf(
+				"compile: %s::%s — windows/* imports are not valid on %s",
+				e.Module, sig.Name, c.arch,
+			)
+
+		case abi.DarwinLib:
+			return fmt.Errorf(
+				"compile: %s::%s — darwin/* imports are not valid on %s",
+				e.Module, sig.Name, c.arch,
+			)
+
+		case abi.BIOSService:
+			return fmt.Errorf(
+				"compile: %s::%s — hw/bios backend not yet implemented",
+				e.Module, sig.Name,
+			)
+
+		case abi.UEFIService:
+			return fmt.Errorf(
+				"compile: %s::%s — hw/uefi backend not yet implemented",
+				e.Module, sig.Name,
+			)
+
+		case abi.GPUIntrinsic:
+			return fmt.Errorf(
+				"compile: %s::%s — gpu/* intrinsics are only valid inside "+
+					"@cuda/@msl/@vulkan-exported functions; add the export suffix",
+				e.Module, sig.Name,
+			)
+
+		default:
+			return fmt.Errorf(
+				"compile: %s::%s — unrecognised import namespace",
+				e.Module, sig.Name,
+			)
 		}
+
 		numImportFuncs++
 	}
 
@@ -259,7 +261,6 @@ func (c *moduleCompiler) compile() error {
 			continue
 		}
 
-		// Inject the required temporary build context to satisfy the new signature
 		tempCtx := bctx.NewBuildContext(c.m)
 		tempCtx.ImportPtrMasks = c.importPtrMasks
 		tempCtx.ImportHptrMasks = c.importHptrMasks
@@ -295,8 +296,9 @@ func (c *moduleCompiler) compile() error {
 		if localIdx < 0 || localIdx >= len(c.funcOff) {
 			continue
 		}
+		export := abi.ParseExport(e.Name)
 		c.obj.Symbols = append(c.obj.Symbols, object.Symbol{
-			Name:   e.Name,
+			Name:   export.Name, // stripped of @-suffix
 			Kind:   object.SymDefined,
 			Offset: c.funcOff[localIdx],
 		})
@@ -313,7 +315,7 @@ func (c *moduleCompiler) compile() error {
 func (c *moduleCompiler) resolveSyscallImport(
 	funcIdx int, moduleName, funcName string, ptrMask []bool, ft wasm.FuncType,
 ) error {
-	n, ok := linuxplatform.SyscallNumber(funcName, c.arch)
+	n, ok := linuxabi.SyscallNumber(funcName, c.arch)
 	if !ok {
 		return fmt.Errorf("unknown syscall %q for arch %q", funcName, c.arch)
 	}
@@ -323,7 +325,7 @@ func (c *moduleCompiler) resolveSyscallImport(
 		number:  n,
 		ptrMask: ptrMask,
 	}
-	fmt.Fprintf(os.Stderr, "compile: syscall import %q::%q → inline syscall %d (%s)\n",
+	fmt.Fprintf(os.Stderr, "compile: syscall import %s::%s → inline syscall %d (%s)\n",
 		moduleName, funcName, n, c.arch)
 	return nil
 }
@@ -352,9 +354,7 @@ func (c *moduleCompiler) generateCallbackTrampolines(numImportFuncs int) {
 		targetOff := c.funcOff[localIdx]
 		trampolineOff := len(c.code)
 
-		// mov r15, [rip + __wasm_mem_base]
-		// Loads the wasm base directly; no add-65536 needed since __wasm_mem_base
-		// already points to wasm byte 0 (the mmap'd region base).
+		// Load wasm base into R15.
 		c.code = append(c.code, 0x4C, 0x8B, 0x3D)
 		c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
 			Offset: trampolineOff + 3,
@@ -363,7 +363,7 @@ func (c *moduleCompiler) generateCallbackTrampolines(numImportFuncs int) {
 		})
 		c.code = asm.Append32LE(c.code, 0)
 
-		// Convert incoming native pointers back to wasm offsets (sub reg, r15).
+		// Convert native pointer params back to wasm offsets (sub reg, r15).
 		nParams := len(ft.Params)
 		if nParams > 6 {
 			nParams = 6
@@ -374,7 +374,7 @@ func (c *moduleCompiler) generateCallbackTrampolines(numImportFuncs int) {
 			}
 		}
 
-		// jmp to the target wasm function body.
+		// Jump to the target function body.
 		c.code = append(c.code, 0xE9)
 		rel := int32(targetOff - (len(c.code) + 4))
 		c.code = asm.Append32LE(c.code, uint32(rel))
@@ -392,47 +392,36 @@ func (c *moduleCompiler) generateCallbackTrampolines(numImportFuncs int) {
 
 func (c *moduleCompiler) applyRelocs(numImportFuncs int) error {
 	for _, r := range c.relocs {
-		if r.funcIdx == -1 {
-			// R15 load → __wasm_mem_base
+		switch {
+		case r.funcIdx == -1:
 			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
 				Symbol: "__wasm_mem_base",
 				Kind:   object.RelocRel32,
 			})
-			continue
-		}
 
-		if r.funcIdx == -2 {
-			// Lazy-init call → __vertex_memory_init
+		case r.funcIdx == -2:
 			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
 				Symbol: "__vertex_memory_init",
 				Kind:   object.RelocRel32,
 			})
-			continue
-		}
 
-		if r.funcIdx == -3 {
-			// Handle Table Load → __vertex_handle_table
+		case r.funcIdx == -3:
 			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
 				Symbol: "__vertex_handle_table",
 				Kind:   object.RelocRel32,
 			})
-			continue
-		}
 
-		if r.funcIdx == -4 {
-			// Handle Count Load (atomic bump) → __vertex_handle_count
+		case r.funcIdx == -4:
 			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
 				Offset: r.codeOff,
 				Symbol: "__vertex_handle_count",
 				Kind:   object.RelocRel32,
 			})
-			continue
-		}
 
-		if r.isAbs64 {
+		case r.isAbs64:
 			sym := ""
 			if r.funcIdx < numImportFuncs {
 				sym = c.importNames[r.funcIdx]
@@ -444,12 +433,12 @@ func (c *moduleCompiler) applyRelocs(numImportFuncs int) error {
 				}
 			}
 			c.obj.Relocs = append(c.obj.Relocs, object.Reloc{
-				Offset: r.codeOff, Symbol: sym, Kind: object.RelocAbs64,
+				Offset: r.codeOff,
+				Symbol: sym,
+				Kind:   object.RelocAbs64,
 			})
-			continue
-		}
 
-		if r.funcIdx < numImportFuncs {
+		case r.funcIdx < numImportFuncs:
 			if _, isInlined := c.inlinedImports[r.funcIdx]; isInlined {
 				continue
 			}
@@ -458,15 +447,15 @@ func (c *moduleCompiler) applyRelocs(numImportFuncs int) error {
 				Symbol: c.importNames[r.funcIdx],
 				Kind:   object.RelocRel32,
 			})
-			continue
-		}
 
-		localIdx := r.funcIdx - numImportFuncs
-		if localIdx >= len(c.funcOff) {
-			return fmt.Errorf("compiler: local func index %d out of range", localIdx)
+		default:
+			localIdx := r.funcIdx - numImportFuncs
+			if localIdx >= len(c.funcOff) {
+				return fmt.Errorf("compiler: local func index %d out of range", localIdx)
+			}
+			rel := int32(c.funcOff[localIdx] - (r.codeOff + 4))
+			asm.Put32LE(c.code[r.codeOff:], uint32(rel))
 		}
-		rel := int32(c.funcOff[localIdx] - (r.codeOff + 4))
-		asm.Put32LE(c.code[r.codeOff:], uint32(rel))
 	}
 	return nil
 }
@@ -475,12 +464,14 @@ func (c *moduleCompiler) localFuncSymbolName(localIdx int) string {
 	for _, e := range c.m.Exports.Entries {
 		if e.Kind == wasm.ExportFunc {
 			if int(e.Idx)-int(c.m.Imports.NumFuncs()) == localIdx {
-				return e.Name
+				return abi.ParseExport(e.Name).Name
 			}
 		}
 	}
 	return fmt.Sprintf("__local_func_%d", localIdx)
 }
+
+// ── Constant expression evaluators ───────────────────────────────────────────
 
 func evalConstExprI32(expr wasm.ConstExpr) (int32, error) {
 	b := expr.Bytes()
