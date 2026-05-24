@@ -191,9 +191,8 @@ func (c *moduleCompiler) compile() error {
 			c.importNames = append(c.importNames, "")
 
 		case abi.LinuxLib:
-			sym := e.Module + "::" + sig.Name
-			c.importNames = append(c.importNames, sym)
-			c.obj.Symbols = append(c.obj.Symbols, object.Symbol{Name: sym, Kind: object.SymUndefined})
+			c.importNames = append(c.importNames, sig.Name)
+			c.obj.Symbols = append(c.obj.Symbols, object.Symbol{Name: sig.Name, Kind: object.SymUndefined})
 
 		case abi.VcpkgLib:
 			sym := sig.Name
@@ -207,8 +206,6 @@ func (c *moduleCompiler) compile() error {
 			sym := "__vertex_memory_" + strings.ReplaceAll(sig.Name, ".", "_")
 			c.importNames = append(c.importNames, sym)
 			c.obj.Symbols = append(c.obj.Symbols, object.Symbol{Name: sym, Kind: object.SymUndefined})
-
-		// ── Not yet implemented ───────────────────────────────────────────────
 
 		case abi.WindowsDLL:
 			return fmt.Errorf(
@@ -298,7 +295,7 @@ func (c *moduleCompiler) compile() error {
 		}
 		export := abi.ParseExport(e.Name)
 		c.obj.Symbols = append(c.obj.Symbols, object.Symbol{
-			Name:   export.Name, // stripped of @-suffix
+			Name:   export.Name,
 			Kind:   object.SymDefined,
 			Offset: c.funcOff[localIdx],
 		})

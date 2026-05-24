@@ -202,16 +202,12 @@ func (t *Target) buildImportInfo(ctx *context.BuildContext) (map[int]inlinedImpo
 					ptrMask: sig.PtrMask,
 				}
 			}
-			importNames = append(importNames, "") // inlined; reloc skipped
+			importNames = append(importNames, "")
 
 		case abi.LinuxLib:
-			// Symbol qualified with the full module path so the linker can
-			// distinguish linux/libc::fopen from any other fopen.
-			importNames = append(importNames, e.Module+"::"+sig.Name)
+			importNames = append(importNames, sig.Name)
 
 		case abi.VcpkgLib:
-			// lib/* libraries are resolved by the vcpkg-driven link step.
-			// Unqualified by default so the archive's own symbol names match.
 			sym := sig.Name
 			if t.QualifiedSymbols {
 				sym = e.Module + "::" + sig.Name
@@ -219,12 +215,8 @@ func (t *Target) buildImportInfo(ctx *context.BuildContext) (map[int]inlinedImpo
 			importNames = append(importNames, sym)
 
 		case abi.VertexMemory:
-			// Resolved to __vertex_memory_* stubs injected by memory.Emit.
-			// Dots in allocator sub-names (e.g. "heap.alloc") become underscores.
 			sym := "__vertex_memory_" + strings.ReplaceAll(sig.Name, ".", "_")
 			importNames = append(importNames, sym)
-
-		// ── Not yet implemented ───────────────────────────────────────────────
 
 		case abi.WindowsDLL:
 			return nil, nil, 0, fmt.Errorf(
