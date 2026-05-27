@@ -1,13 +1,16 @@
+// driver/driver.go
 package driver
 
 import (
 	"fmt"
 
-	"github.com/vertex-language/compiler/concurrency"
 	"github.com/vertex-language/compiler/context"
-	"github.com/vertex-language/compiler/memory"
 	"github.com/vertex-language/compiler/object"
 	"github.com/vertex-language/compiler/wasm"
+
+	// Import the architecture-specific memory allocators directly
+	amd64mem "github.com/vertex-language/compiler/cpu/amd64/memory"
+	arm64mem "github.com/vertex-language/compiler/cpu/arm64/memory"
 )
 
 // Driver orchestrates the compiler pipeline.
@@ -15,11 +18,9 @@ type Driver struct {
 	targets map[string]Target
 }
 
-// New initializes a new compilation driver.
+// New initialises a new compilation driver.
 func New() *Driver {
-	return &Driver{
-		targets: make(map[string]Target),
-	}
+	return &Driver{targets: make(map[string]Target)}
 }
 
 // Register adds a code generation target to the driver.
@@ -27,47 +28,58 @@ func (d *Driver) Register(t Target) {
 	d.targets[t.ID()] = t
 }
 
-// Compile executes the compilation pipeline for the given Wasm module.
-func (d *Driver) Compile(m *wasm.Module, defaultArch string) (*object.WasmObj, error) {
-	ctx := context.NewBuildContext(m)
+// Compile executes the full compilation pipeline and returns the assembled
+// object. Call Emit() on the result to obtain the native byte representation
+// (ELF64, COFF .obj, or Mach-O MH_OBJECT).
+func (d *Driver) Compile(m *wasm.Module, arch object.Arch, platform object.Platform) (object.Object, error) {
+	obj := object.New(arch, platform)
+	ctx := context.NewBuildContext(m, obj)
+
+	defaultArch := archID(arch)
 
 	routes, err := Analyze(ctx, defaultArch)
 	if err != nil {
 		return nil, err
 	}
 
-	// Always emit allocator stubs so that __vertex_memory_init and
-	// __wasm_mem_base exist in every binary.  The mmap is lazy (triggered by
-	// the first wasm function call) so binaries without heap imports pay no
-	// runtime cost beyond a single pointer load per prologue.
-	if defaultArch != "amd64" {
-		return nil, fmt.Errorf("driver: memory allocator not yet ported to %s", defaultArch)
-	}
-	if err := memory.Emit(ctx); err != nil {
-		return nil, fmt.Errorf("driver: failed to emit memory stubs: %w", err)
+	// Route memory emission directly to the architecture-specific packages
+	switch arch {
+	case object.AMD64:
+		err = amd64mem.Emit(ctx)
+	case object.ARM64:
+		err = arm64mem.Emit(ctx)
+	default:
+		return nil, fmt.Errorf("driver: memory allocator not yet ported to %s", arch)
 	}
 
-	if ctx.NeedsAsync || ctx.NeedsThread || ctx.NeedsProcess {
-		if defaultArch != "amd64" {
-			return nil, fmt.Errorf("driver: concurrency not yet ported to %s", defaultArch)
-		}
-		if err := concurrency.Emit(ctx); err != nil {
-			return nil, fmt.Errorf("driver: failed to emit concurrency stubs: %w", err)
-		}
+	if err != nil {
+		return nil, fmt.Errorf("driver: failed to emit memory stubs: %w", err)
 	}
 
 	for targetID, funcs := range routes {
 		if len(funcs) == 0 {
 			continue
 		}
-		target, exists := d.targets[targetID]
-		if !exists {
+		t, ok := d.targets[targetID]
+		if !ok {
 			return nil, fmt.Errorf("driver: unsupported target backend %q", targetID)
 		}
-		if err := target.Emit(ctx, funcs); err != nil {
+		if err := t.Emit(ctx, funcs); err != nil {
 			return nil, fmt.Errorf("driver: %s compilation failed: %w", targetID, err)
 		}
 	}
 
 	return ctx.Obj, nil
+}
+
+// archID maps an object.Arch to the string routing key used in RoutingTable.
+func archID(a object.Arch) string {
+	switch a {
+	case object.AMD64:
+		return "amd64"
+	case object.ARM64:
+		return "arm64"
+	default:
+		return a.String()
+	}
 }

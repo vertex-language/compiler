@@ -12,8 +12,7 @@ import (
 	"os"
 
 	"github.com/vertex-language/compiler"
-	"github.com/vertex-language/compiler/linker"
-	"github.com/vertex-language/compiler/object"
+	"github.com/vertex-language/compiler/linker/elf"
 	"github.com/vertex-language/compiler/wasm"
 )
 
@@ -23,23 +22,50 @@ func main() {
 
 	m := buildModule()
 
-	// No PointerArgs map, no platform.System — the import name carries
-	// everything the compiler needs via the @ signature.
+	// 1. Compile the WASM module into a native object representation.
 	obj, err := compiler.CompileWith(m, compiler.Options{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "compile: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("compiled:  %d bytes code  %d symbols  %d relocations\n",
-		len(obj.Code), len(obj.Symbols), len(obj.Relocs))
+	// 2. Emit the native object bytes (ELF64 ET_REL format).
+	objBytes, err := obj.Emit()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "emit object: %v\n", err)
+		os.Exit(1)
+	}
 
-	bin, err := linker.Link([]*object.WasmObj{obj}, linker.Options{
-		Output: linker.ELF,
-		Entry:  "main",
-	})
+	// 3. Parse the emitted object bytes for the linker.
+	parsedObj, err := elf.ParseObject(objBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse object: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("compiled:  %d sections  %d symbols  %d relocations\n",
+		len(parsedObj.Sections), len(parsedObj.Symbols), len(parsedObj.Relocs))
+
+	// 4. Setup the ELF Linker for AMD64.
+	lnk := elf.NewLinker(elf.EM_X86_64) // 0x3E
+	
+	// CRITICAL FIX: Use the synthesized _start wrapper as the entry point
+	// instead of main, so the process terminates safely via sys_exit.
+	lnk.SetEntry("_start")
+	
+	lnk.AddObject(parsedObj)
+
+	// 5. Run the linker phases (resolution, merging, layout, patching).
+	result, err := lnk.Link()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "link: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 6. Build and emit the final executable binary.
+	bin, err := result.Builder().Emit()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build elf: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -57,7 +83,7 @@ const (
 )
 
 const (
-	msg1    = "Hello from linux:kernel/syscalls!\n"
+	msg1    = "Hello from linux/kernel/syscalls!\n"
 	msg2    = "No libc. No interpreter. Just the kernel.\n"
 	msg1Off = int32(0)
 	msg2Off = int32(len(msg1))
@@ -78,7 +104,8 @@ func buildModule() *wasm.Module {
 		Results: []wasm.ValType{wasm.I32},
 	})
 
-	m.Imports.AddFunc("linux:kernel/syscalls", "write@i32.ptr.i32", tWrite)
+	// Note: Updated the namespace to use '/' instead of ':' per abi.go routing rules.
+	m.Imports.AddFunc("linux/kernel/syscalls", "write@i32.ptr.i32", tWrite)
 
 	m.Functions.Add(tMain)
 	m.Memories.Add(wasm.MemoryType{Lim: wasm.Limits{Min: 1}})

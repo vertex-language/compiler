@@ -5,9 +5,11 @@ import (
 	"fmt"
 )
 
-// buildImage turns Builder state into a fully-populated PEImage.
+// buildImage converts Builder state into a fully populated PEImage.
 func (b *Builder) buildImage() (*PEImage, error) {
-	// Step 1: Resolve configuration defaults.
+	le := binary.LittleEndian
+
+	// ── Step 1: Resolve defaults ──────────────────────────────────────────────
 	imageBase := b.imageBase
 	if imageBase == 0 {
 		if b.dllMode {
@@ -21,29 +23,40 @@ func (b *Builder) buildImage() (*PEImage, error) {
 	heapReserve  := orDefault(b.heapReserve, defaultHeapReserve)
 	heapCommit   := orDefault(b.heapCommit, defaultHeapCommit)
 
-	// Step 2: Count synthetic sections.
-	needsIdata := len(b.imports) > 0
-	needsEdata := len(b.exports) > 0
-	needsReloc := b.dllCharacteristics&IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE != 0
-	needsDebug := b.debug != nil
+	// ── Step 2: Decide which synthetic sections are needed ────────────────────
+	needsIdata      := len(b.imports) > 0
+	needsEdata      := len(b.exports) > 0
+	needsDelayIdata := len(b.delayImports) > 0
+	needsPdata      := len(b.pdataFuncs) > 0
+	needsXdata      := len(b.xdataBlob) > 0
+	needsTLS        := len(b.tlsData) > 0 || len(b.tlsCallbacks) > 0
+	needsLoadCfg    := b.loadConfig != nil
+	needsDebug      := len(b.debugEntries) > 0
+	needsReloc      := b.dllCharacteristics&IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE != 0
 
+	// .xdata is always paired with .pdata; treat them together.
+	_ = needsXdata
+
+	// Total section count determines sizeOfHeaders.
 	syntheticCount := 0
-	if needsIdata { syntheticCount++ }
-	if needsEdata { syntheticCount++ }
-	if needsReloc { syntheticCount++ }
-	if needsDebug { syntheticCount++ }
-
+	for _, flag := range []bool{needsIdata, needsEdata, needsDelayIdata,
+		needsPdata, len(b.xdataBlob) > 0,
+		needsTLS, needsLoadCfg, needsDebug, needsReloc} {
+		if flag {
+			syntheticCount++
+		}
+	}
 	numSections := len(b.sections) + syntheticCount
 
-	// Step 3: Header region size and first section VA.
+	// ── Step 3: Header size and first section VA ───────────────────────────────
 	sizeOfHeaders := align32(
 		uint32(fixedHeaderBytes+numSections*sectionHeaderSize),
 		fileAlignment,
 	)
 	firstSectionVA := align32(sizeOfHeaders, sectionAlignment)
 
-	// Step 4: Pre-size synthetic sections.
-	var idataPreSize, edataPreSize, debugPreSize uint32
+	// ── Step 4: Pre-size synthetic sections ───────────────────────────────────
+	var idataPreSize, edataPreSize, delayPreSize uint32
 
 	if needsIdata {
 		pre, err := buildIDATA(b.imports, 0)
@@ -53,13 +66,19 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		idataPreSize = uint32(len(pre.Data))
 	}
 	if needsEdata {
-		edataPreSize = edataSize(b.exports, b.dllName)
+		edataPreSize = measureEDATA(b.exports, b.dllName)
 	}
-	if needsDebug {
-		debugPreSize = align32(28+uint32(len(b.debug.Data)), 4)
+	if needsDelayIdata {
+		pre, err := buildDelayIDATA(b.delayImports, 0, 0)
+		if err != nil {
+			return nil, fmt.Errorf("pe: pre-sizing delay .idata: %w", err)
+		}
+		delayPreSize = uint32(len(pre.descriptorData) + len(pre.iatData) +
+			len(pre.intData) + len(pre.hnData) + len(pre.nameData) + len(pre.moduleHandles))
 	}
+	_ = delayPreSize
 
-	// Step 5: Assign virtual addresses.
+	// ── Step 5: Assign virtual addresses to all sections ──────────────────────
 	type sectionLayout struct {
 		name        string
 		chars       uint32
@@ -85,38 +104,84 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		va = align32(va+vsz, sectionAlignment)
 	}
 
-	var idataLayout, edataLayout, debugLayout sectionLayout
+	// Synthetic section layout placeholders.
+	var (
+		idataLayout    sectionLayout
+		edataLayout    sectionLayout
+		delayLayout    sectionLayout
+		pdataLayout    sectionLayout
+		xdataLayout    sectionLayout
+		tlsLayout      sectionLayout
+		loadCfgLayout  sectionLayout
+		debugLayout    sectionLayout
+		relocLayout    sectionLayout
+	)
 
 	if needsIdata {
 		idataLayout = sectionLayout{
-			name:        ".idata",
-			chars:       IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
-			virtualAddr: va,
-			virtualSize: idataPreSize,
+			name: ".idata", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+			virtualAddr: va, virtualSize: idataPreSize,
 		}
 		va = align32(va+idataPreSize, sectionAlignment)
 	}
 	if needsEdata {
 		edataLayout = sectionLayout{
-			name:        ".edata",
-			chars:       IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
-			virtualAddr: va,
-			virtualSize: edataPreSize,
+			name: ".edata", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+			virtualAddr: va, virtualSize: edataPreSize,
 		}
 		va = align32(va+edataPreSize, sectionAlignment)
 	}
-	if needsDebug {
-		debugLayout = sectionLayout{
-			name:        ".debug",
-			chars:       IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE,
+	if needsDelayIdata {
+		// Placeholder; actual size computed in step 8.
+		delayLayout = sectionLayout{
+			name: ".didat", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
 			virtualAddr: va,
-			virtualSize: debugPreSize,
 		}
-		va = align32(va+debugPreSize, sectionAlignment)
+		va = align32(va+4096, sectionAlignment) // conservative pre-size
+	}
+	if needsPdata {
+		pdataSz := uint32(len(b.pdataFuncs) * 12)
+		pdataLayout = sectionLayout{
+			name: ".pdata", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+			virtualAddr: va, virtualSize: pdataSz,
+		}
+		va = align32(va+pdataSz, sectionAlignment)
+	}
+	if len(b.xdataBlob) > 0 {
+		xdataLayout = sectionLayout{
+			name: ".xdata", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+			virtualAddr: va, virtualSize: uint32(len(b.xdataBlob)),
+		}
+		va = align32(va+uint32(len(b.xdataBlob)), sectionAlignment)
+	}
+	if needsTLS {
+		// TLS section: 8-byte IMAGE_TLS_DIRECTORY64 + template data + callback array.
+		tlsSz := uint32(40 + len(b.tlsData) + (len(b.tlsCallbacks)+1)*8)
+		tlsLayout = sectionLayout{
+			name: ".tls", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+			virtualAddr: va, virtualSize: tlsSz,
+		}
+		va = align32(va+tlsSz, sectionAlignment)
+	}
+	if needsLoadCfg {
+		lcSz := uint32(loadConfigSize)
+		loadCfgLayout = sectionLayout{
+			name: ".rdata$lc", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+			virtualAddr: va, virtualSize: lcSz,
+		}
+		va = align32(va+lcSz, sectionAlignment)
+	}
+	if needsDebug {
+		debugSz := buildDebugSectionSize(b.debugEntries)
+		debugLayout = sectionLayout{
+			name: ".debug", chars: ScnDiscardable,
+			virtualAddr: va, virtualSize: debugSz,
+		}
+		va = align32(va+debugSz, sectionAlignment)
 	}
 	relocVA := va
 
-	// Step 6: Build symbol VA map.
+	// ── Step 6: Build symbol VA map ───────────────────────────────────────────
 	symVA := make(map[string]uint64, len(b.symbols))
 	for _, sym := range b.symbols {
 		for _, lay := range userLayouts {
@@ -127,143 +192,119 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		}
 	}
 
-	// Step 7: Apply user relocations, collect base-reloc entries.
+	// ── Step 7: Collect base-reloc entries ────────────────────────────────────
 	type baseRelocEntry struct {
 		rva uint32
 		typ uint8
 	}
 	var baseRelocs []baseRelocEntry
-	le := binary.LittleEndian
 
-	for _, rel := range b.relocs {
-		var lay *sectionLayout
-		for i := range userLayouts {
-			if userLayouts[i].name == rel.Section {
-				lay = &userLayouts[i]
-				break
-			}
-		}
-		if lay == nil {
-			return nil, fmt.Errorf("pe: reloc references unknown section %q", rel.Section)
-		}
-		targetVA, ok := symVA[rel.Symbol]
-		if !ok {
-			return nil, fmt.Errorf("pe: reloc references unknown symbol %q", rel.Symbol)
-		}
-		targetRVA := uint32(targetVA - imageBase)
-		patchRVA  := lay.virtualAddr + rel.Offset
-
-		switch rel.Type {
-		case IMAGE_REL_AMD64_ADDR64:
-			if int(rel.Offset)+8 > len(lay.data) {
-				return nil, fmt.Errorf("pe: ADDR64 reloc offset %d out of range", rel.Offset)
-			}
-			le.PutUint64(lay.data[rel.Offset:], targetVA)
-			baseRelocs = append(baseRelocs, baseRelocEntry{patchRVA, IMAGE_REL_BASED_DIR64})
-
-		case IMAGE_REL_AMD64_ADDR32:
-			if int(rel.Offset)+4 > len(lay.data) {
-				return nil, fmt.Errorf("pe: ADDR32 reloc offset %d out of range", rel.Offset)
-			}
-			if targetVA > 0xFFFFFFFF {
-				return nil, fmt.Errorf("pe: ADDR32 target VA 0x%X does not fit in 32 bits", targetVA)
-			}
-			le.PutUint32(lay.data[rel.Offset:], uint32(targetVA))
-			baseRelocs = append(baseRelocs, baseRelocEntry{patchRVA, IMAGE_REL_BASED_HIGHLOW})
-
-		case IMAGE_REL_AMD64_ADDR32NB:
-			if int(rel.Offset)+4 > len(lay.data) {
-				return nil, fmt.Errorf("pe: ADDR32NB reloc offset %d out of range", rel.Offset)
-			}
-			le.PutUint32(lay.data[rel.Offset:], targetRVA)
-
-		case IMAGE_REL_AMD64_REL32:
-			if int(rel.Offset)+4 > len(lay.data) {
-				return nil, fmt.Errorf("pe: REL32 reloc offset %d out of range", rel.Offset)
-			}
-			rel32 := int64(targetVA) - int64(imageBase+uint64(patchRVA)+4)
-			if rel32 < -0x80000000 || rel32 > 0x7FFFFFFF {
-				return nil, fmt.Errorf("pe: REL32 displacement 0x%X out of range for %q", rel32, rel.Symbol)
-			}
-			le.PutUint32(lay.data[rel.Offset:], uint32(int32(rel32)))
-
-		case IMAGE_REL_AMD64_REL32_1, IMAGE_REL_AMD64_REL32_2,
-			IMAGE_REL_AMD64_REL32_3, IMAGE_REL_AMD64_REL32_4,
-			IMAGE_REL_AMD64_REL32_5:
-			if int(rel.Offset)+4 > len(lay.data) {
-				return nil, fmt.Errorf("pe: REL32_N reloc offset %d out of range", rel.Offset)
-			}
-			extra := int64(rel.Type - IMAGE_REL_AMD64_REL32)
-			rel32 := int64(targetVA) - int64(imageBase+uint64(patchRVA)+4+uint32(extra))
-			if rel32 < -0x80000000 || rel32 > 0x7FFFFFFF {
-				return nil, fmt.Errorf("pe: REL32_%d displacement out of range", extra)
-			}
-			le.PutUint32(lay.data[rel.Offset:], uint32(int32(rel32)))
-
-		case IMAGE_REL_AMD64_SECREL:
-			if int(rel.Offset)+4 > len(lay.data) {
-				return nil, fmt.Errorf("pe: SECREL reloc offset %d out of range", rel.Offset)
-			}
-			le.PutUint32(lay.data[rel.Offset:], targetRVA-lay.virtualAddr)
-
-		case IMAGE_REL_AMD64_ABSOLUTE:
-			// no-op
-
-		default:
-			return nil, fmt.Errorf("pe: unsupported relocation type 0x%04X for %q", rel.Type, rel.Symbol)
-		}
-	}
-
-	// Step 8: Build synthetic sections with final VAs.
+	// ── Step 8: Build synthetic sections with final VAs ───────────────────────
 	if needsIdata {
 		idat, err := buildIDATA(b.imports, idataLayout.virtualAddr)
 		if err != nil {
 			return nil, fmt.Errorf("pe: building .idata: %w", err)
 		}
-		idataLayout.data        = idat.Data
+		idataLayout.data = idat.Data
 		idataLayout.virtualSize = uint32(len(idat.Data))
 	}
 	if needsEdata {
-		eb, err := buildEDATA(b.exports, b.dllName, b.symbols, userLayouts, imageBase)
+		eb, err := buildEDATA(b.exports, b.dllName, symVA, imageBase)
 		if err != nil {
 			return nil, fmt.Errorf("pe: building .edata: %w", err)
 		}
-		edataLayout.data        = eb
+		edataLayout.data = eb
 		edataLayout.virtualSize = uint32(len(eb))
 	}
+	if needsDelayIdata {
+		ddat, err := buildDelayIDATA(b.delayImports, delayLayout.virtualAddr, imageBase)
+		if err != nil {
+			return nil, fmt.Errorf("pe: building delay .idata: %w", err)
+		}
+		delayLayout.data = ddat.flat()
+		delayLayout.virtualSize = uint32(len(delayLayout.data))
+		// Module handles in .data are zeroed at runtime; no base relocs needed for
+		// the RVA-based v2 descriptor format.
+	}
+	if needsPdata {
+		pdataLayout.data = buildPdataSection(b.pdataFuncs)
+	}
+	if len(b.xdataBlob) > 0 {
+		xdataLayout.data = b.xdataBlob
+	}
+	if needsTLS {
+		tlsDir, tlsData := buildTLSSection(b.tlsData, b.tlsCallbacks,
+			imageBase, tlsLayout.virtualAddr)
+		tlsLayout.data = tlsData
+		tlsLayout.virtualSize = uint32(len(tlsData))
+		// Image base is in TLS directory VAs; add base relocations.
+		tlsDirVA := tlsLayout.virtualAddr
+		for _, off := range []uint32{0, 8, 16, 24} { // StartAddr, EndAddr, IndexAddr, Callbacks
+			if off < 24 || tlsDir.AddressOfCallbacks != 0 {
+				baseRelocs = append(baseRelocs, baseRelocEntry{tlsDirVA + off, IMAGE_REL_BASED_DIR64})
+			}
+		}
+		_ = tlsDir
+	}
+	if needsLoadCfg {
+		loadCfgLayout.data = buildLoadConfig(b.loadConfig)
+	}
 	if needsDebug {
-		debugLayout.data        = buildDebugSection(b.debug, debugLayout.virtualAddr)
+		debugLayout.data = buildDebugSection(b.debugEntries, debugLayout.virtualAddr)
 		debugLayout.virtualSize = uint32(len(debugLayout.data))
 	}
 
-	var relocLayout sectionLayout
+	var relocData []byte
 	if needsReloc {
-		rb := buildBaseReloc(baseRelocs)
+		relocData = buildBaseReloc(baseRelocs)
 		relocLayout = sectionLayout{
-			name:        ".reloc",
-			chars:       IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE,
-			virtualAddr: relocVA,
-			virtualSize: uint32(len(rb)),
-			data:        rb,
+			name: ".reloc", chars: ScnDiscardable,
+			virtualAddr: relocVA, virtualSize: uint32(len(relocData)),
+			data: relocData,
 		}
 	}
 
-	// Step 9: Assemble final section list and SizeOfImage.
-	var allLayouts []sectionLayout
-	allLayouts = append(allLayouts, userLayouts...)
-	if needsIdata { allLayouts = append(allLayouts, idataLayout) }
-	if needsEdata { allLayouts = append(allLayouts, edataLayout) }
-	if needsDebug { allLayouts = append(allLayouts, debugLayout) }
-	if needsReloc { allLayouts = append(allLayouts, relocLayout) }
+	// ── Step 9: Assemble final section list ───────────────────────────────────
+	var all []sectionLayout
+	all = append(all, userLayouts...)
+	if needsIdata {
+		all = append(all, idataLayout)
+	}
+	if needsEdata {
+		all = append(all, edataLayout)
+	}
+	if needsDelayIdata {
+		all = append(all, delayLayout)
+	}
+	if needsPdata {
+		all = append(all, pdataLayout)
+	}
+	if len(b.xdataBlob) > 0 {
+		all = append(all, xdataLayout)
+	}
+	if needsTLS {
+		all = append(all, tlsLayout)
+	}
+	if needsLoadCfg {
+		all = append(all, loadCfgLayout)
+	}
+	if needsDebug {
+		all = append(all, debugLayout)
+	}
+	if needsReloc {
+		all = append(all, relocLayout)
+	}
 
+	// ── Step 10: SizeOfImage ─────────────────────────────────────────────────
 	sizeOfImage := align32(sizeOfHeaders, sectionAlignment)
-	for _, lay := range allLayouts {
+	for _, lay := range all {
 		if end := align32(lay.virtualAddr+lay.virtualSize, sectionAlignment); end > sizeOfImage {
 			sizeOfImage = end
 		}
 	}
+	_ = sizeOfImage
 
-	// Step 10: Resolve entry-point RVA.
+	// ── Step 11: Resolve entry-point RVA ─────────────────────────────────────
 	var entryRVA uint32
 	if b.entry != "" {
 		v, ok := symVA[b.entry]
@@ -273,35 +314,54 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		entryRVA = uint32(v - imageBase)
 	}
 
-	// Step 11: Populate data directories.
-	var dataDirs [numDataDirectories]DataDirectory
+	// ── Step 12: Populate data directories ───────────────────────────────────
+	var dataDirs [NumDataDirectories]DataDirectory
+
 	if needsIdata {
 		idat, _ := buildIDATA(b.imports, idataLayout.virtualAddr)
-		dataDirs[dataDirImport] = DataDirectory{idat.ImportDirRVA, idat.ImportDirSize}
-		dataDirs[dataDirIAT]    = DataDirectory{idat.IATRVA, idat.IATSize}
+		dataDirs[DataDirImport] = DataDirectory{idat.ImportDirRVA, idat.ImportDirSize}
+		dataDirs[DataDirIAT]    = DataDirectory{idat.IATRVA, idat.IATSize}
 	}
 	if needsEdata {
-		dataDirs[dataDirExport] = DataDirectory{edataLayout.virtualAddr, edataLayout.virtualSize}
+		dataDirs[DataDirExport] = DataDirectory{edataLayout.virtualAddr, edataLayout.virtualSize}
 	}
-	if needsReloc {
-		dataDirs[dataDirBaseReloc] = DataDirectory{relocLayout.virtualAddr, relocLayout.virtualSize}
+	if needsDelayIdata {
+		ddat, _ := buildDelayIDATA(b.delayImports, delayLayout.virtualAddr, imageBase)
+		dataDirs[DataDirDelayImport] = DataDirectory{ddat.descriptorRVA, ddat.descriptorSize}
+	}
+	if needsPdata {
+		dataDirs[DataDirException] = DataDirectory{pdataLayout.virtualAddr, pdataLayout.virtualSize}
+	}
+	if needsTLS {
+		dataDirs[DataDirTLS] = DataDirectory{tlsLayout.virtualAddr, 40} // sizeof IMAGE_TLS_DIRECTORY64
+	}
+	if needsLoadCfg {
+		dataDirs[DataDirLoadConfig] = DataDirectory{loadCfgLayout.virtualAddr, loadConfigSize}
 	}
 	if needsDebug {
-		dataDirs[dataDirDebug] = DataDirectory{debugLayout.virtualAddr, 28}
+		// The debug data directory points to the first IMAGE_DEBUG_DIRECTORY entry;
+		// size covers all N entries (each 28 bytes).
+		dataDirs[DataDirDebug] = DataDirectory{
+			debugLayout.virtualAddr,
+			uint32(len(b.debugEntries) * 28),
+		}
+	}
+	if needsReloc {
+		dataDirs[DataDirBaseReloc] = DataDirectory{relocLayout.virtualAddr, relocLayout.virtualSize}
 	}
 
-	// Step 12: File characteristics.
+	// ── Step 13: File characteristics ────────────────────────────────────────
 	fileChars := IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | b.extraFileChars
 	if b.dllMode {
 		fileChars |= IMAGE_FILE_DLL
 	}
-	if needsReloc && len(relocLayout.data) == 0 {
+	if needsReloc && len(relocData) == 0 {
 		fileChars |= IMAGE_FILE_RELOCS_STRIPPED
 	}
 
-	// Step 13: Convert to PESection slice.
-	peSections := make([]PESection, len(allLayouts))
-	for i, lay := range allLayouts {
+	// ── Step 14: Convert to PESection slice ──────────────────────────────────
+	peSections := make([]PESection, len(all))
+	for i, lay := range all {
 		peSections[i] = PESection{
 			Name:           lay.name,
 			Chars:          lay.chars,
@@ -311,19 +371,25 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		}
 	}
 
+	_ = le // binary.LittleEndian used in sub-functions
+
 	return &PEImage{
-		Arch:                b.arch,
-		Subsystem:           b.subsystem,
-		ImageBase:           imageBase,
-		Sections:            peSections,
-		DataDirs:            dataDirs,
-		EntryRVA:            entryRVA,
-		StackReserve:        stackReserve,
-		StackCommit:         stackCommit,
-		HeapReserve:         heapReserve,
-		HeapCommit:          heapCommit,
-		DllCharacteristics:  b.dllCharacteristics,
-		FileCharacteristics: fileChars,
-		IsDLL:               b.dllMode,
+		Machine:               b.machine,
+		Subsystem:             b.subsystem,
+		ImageBase:             imageBase,
+		Sections:              peSections,
+		DataDirs:              dataDirs,
+		EntryRVA:              entryRVA,
+		StackReserve:          stackReserve,
+		StackCommit:           stackCommit,
+		HeapReserve:           heapReserve,
+		HeapCommit:            heapCommit,
+		MajorOSVersion:        b.majorOSVersion,
+		MinorOSVersion:        b.minorOSVersion,
+		MajorSubsystemVersion: b.majorSubsystemVersion,
+		MinorSubsystemVersion: b.minorSubsystemVersion,
+		DllCharacteristics:    b.dllCharacteristics,
+		FileCharacteristics:   fileChars,
+		IsDLL:                 b.dllMode,
 	}, nil
 }

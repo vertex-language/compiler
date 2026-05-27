@@ -1,57 +1,80 @@
+// context/build.go
 package context
 
 import (
+	"github.com/vertex-language/compiler/decode"
 	"github.com/vertex-language/compiler/object"
 	"github.com/vertex-language/compiler/wasm"
 )
 
 // BuildContext flows through the entire compiler pipeline.
-// Targets write their machine code and symbols directly into Obj.
 type BuildContext struct {
 	Module *wasm.Module
-	Obj    *object.WasmObj
+	Obj    object.Object
 
-	// ImportPtrMasks maps a WebAssembly import function index to a boolean mask.
-	// True means the parameter is a 'ptr' and requires native memory translation.
-	// e.g., "write@i32.ptr.i32" -> [false, true, false]
+	// StaticDataSize is the number of wasm linear-memory bytes covered by
+	// active data segments. Baked into __vertex_memory_init as an immediate
+	// at compile time — no runtime symbol load needed.
+	StaticDataSize uint32
+
+	// ImportPtrMasks maps a wasm import function index to a per-parameter
+	// boolean mask. True means the parameter is a linear-memory 'ptr' and
+	// needs native-address translation before the call.
 	ImportPtrMasks map[int][]bool
 
-	// ImportHptrMasks maps an import to opaque native handle parameters.
-	// e.g., "fwrite@ptr.i64.i64.hptr" -> [false, false, false, true]
+	// ImportHptrMasks maps an import to its opaque native-handle parameters.
 	ImportHptrMasks map[int][]bool
 
-	// ReturnHptrMasks flags if an import returns a native handle to be intercepted.
-	// e.g., "fopen@ptr.ptr:hptr" -> true
+	// ReturnHptrMasks flags imports whose return value is a native handle
+	// that must be interned in the Handle Table before wasm sees it.
 	ReturnHptrMasks map[int]bool
 
-	// KernelParams maps a routed Wasm function index to its explicit parameter types.
-	// e.g., "@cuda:ptr.ptr.i32" -> ["ptr", "ptr", "i32"]
+	// KernelParams maps a routed wasm function index to its explicit
+	// parameter type annotations from the export suffix.
 	KernelParams map[int][]string
 
 	// NeedsMemory flags whether the module imports any "memory" primitives,
-	// signaling the driver to inject the allocator stubs.
+	// signalling the driver to inject the allocator stubs.
 	NeedsMemory bool
-
-	// Concurrency flags to trigger platform stub generation.
-	NeedsAsync   bool
-	NeedsThread  bool
-	NeedsProcess bool
-
-	// ConcurrentFuncs maps a function index to its concurrency kind ("async", "thread", "process").
-	// The CPU backend uses this to know it should compile the body under the 
-	// internal "__vertex_fn_X" symbol rather than exporting it normally.
-	ConcurrentFuncs map[int]string
 }
 
-// NewBuildContext initializes a fresh compilation session.
-func NewBuildContext(m *wasm.Module) *BuildContext {
+// NewBuildContext initialises a fresh compilation session for module m,
+// writing into obj. StaticDataSize is computed eagerly so every downstream
+// pass (including memory.Emit) can use it immediately.
+func NewBuildContext(m *wasm.Module, obj object.Object) *BuildContext {
 	return &BuildContext{
 		Module:          m,
-		Obj:             &object.WasmObj{},
+		Obj:             obj,
+		StaticDataSize:  computeStaticDataSize(m),
 		ImportPtrMasks:  make(map[int][]bool),
 		ImportHptrMasks: make(map[int][]bool),
 		ReturnHptrMasks: make(map[int]bool),
 		KernelParams:    make(map[int][]string),
-		ConcurrentFuncs: make(map[int]string),
 	}
+}
+
+// computeStaticDataSize scans active data segments and returns the
+// high-water mark of initialised wasm linear-memory bytes relative to
+// offset 0. This is the byte count that __vertex_memory_init copies from
+// the compiled-in .data region into the freshly mmap'd wasm address space.
+func computeStaticDataSize(m *wasm.Module) uint32 {
+	var max uint32
+	for _, d := range m.Datas.Entries {
+		active, ok := d.Mode.(wasm.DataModeActive)
+		if !ok {
+			continue
+		}
+		b := active.Offset.Bytes()
+		if len(b) == 0 || b[0] != 0x41 { // must be i32.const
+			continue
+		}
+		off, err := decode.NewReader(b[1:]).ReadS32()
+		if err != nil || off < 0 {
+			continue
+		}
+		if end := uint32(off) + uint32(len(d.Data)); end > max {
+			max = end
+		}
+	}
+	return max
 }

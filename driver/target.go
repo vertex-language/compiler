@@ -1,13 +1,14 @@
+// driver/target.go  (unchanged — shown for completeness)
 package driver
 
 import "github.com/vertex-language/compiler/context"
 
-// Target is the standard interface for all code emitters (x86_64, cuda, etc.).
+// Target is the standard interface for all code emitters (amd64, cuda, etc.).
 type Target interface {
-	// ID returns the unique identifier for this backend (e.g., "x86_64", "cuda").
+	// ID returns the unique routing key for this backend (e.g. "amd64", "cuda").
 	ID() string
-	
-	// Emit compiles the requested Wasm function indices and appends the resulting
-	// machine code, data, and symbols directly into the shared BuildContext.
+
+	// Emit compiles the requested wasm function indices and writes the
+	// resulting machine code, data, and symbols into the shared BuildContext.
 	Emit(ctx *context.BuildContext, funcIndices []int) error
 }

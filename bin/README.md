@@ -24,10 +24,9 @@ your compiler
   executable binary
 ```
 
-The linker drives `bin` the same way any other caller does — through the
-builder methods (`AddSection`, `AddSymbol`, `AddReloc`, …) and a final
-`Emit()`. There is no special linker interface; the builder pattern is the
-interface.
+The linker drives `bin` the same way any other caller does — through builder
+methods (`AddSection`, `AddSymbol`, `AddReloc`, …) and a final `Emit()`.
+There is no special linker interface; the builder pattern is the interface.
 
 ---
 
@@ -48,13 +47,13 @@ This is the common case for:
 
 ## Formats
 
-| Package                                                        | Format    | Platform              |
-|----------------------------------------------------------------|-----------|-----------------------|
-| `github.com/vertex-language/compiler/bin/elf`                  | ELF64     | Linux, *BSD           |
-| `github.com/vertex-language/compiler/bin/pe`                   | PE32+     | Windows               |
-| `github.com/vertex-language/compiler/bin/macho`                | Mach-O 64 | macOS, iOS            |
-| `github.com/vertex-language/compiler/bin/bootloader/raw`       | Flat bin  | Bare metal, stage 1   |
-| `github.com/vertex-language/compiler/bin/bootloader/uefi`      | PE32+     | UEFI firmware         |
+| Package                                              | Format    | Platform            |
+|------------------------------------------------------|-----------|---------------------|
+| `github.com/vertex-language/compiler/bin/elf`        | ELF64     | Linux, *BSD         |
+| `github.com/vertex-language/compiler/bin/pe`         | PE32+     | Windows             |
+| `github.com/vertex-language/compiler/bin/macho`      | Mach-O 64 | macOS, iOS          |
+| `github.com/vertex-language/compiler/bin/bootloader/raw`  | Flat bin  | Bare metal, stage 1 |
+| `github.com/vertex-language/compiler/bin/bootloader/uefi` | PE32+     | UEFI firmware       |
 
 ---
 
@@ -71,14 +70,6 @@ b.AddSection(elf.Section{
     Flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR,
     Data:  machineCode,
     Align: 16,
-})
-
-b.AddSection(elf.Section{
-    Name:  ".data",
-    Type:  elf.SHT_PROGBITS,
-    Flags: elf.SHF_ALLOC | elf.SHF_WRITE,
-    Data:  initializedData,
-    Align: 8,
 })
 
 b.AddSymbol(elf.Symbol{
@@ -104,21 +95,23 @@ b.AddNeeded("libc.so.6")
 PLT/GOT machinery is available via `elf.NewDynBuilder` for finer control over
 lazy binding stubs and GOT slots.
 
-### Supported
+**Supported:**
 - ELF64 only
 - Static (`ET_EXEC`) and dynamic (`ET_DYN`) executables, shared libraries
 - PLT / GOT / RELA for dynamic imports
 - TLS sections (`.tdata`, `.tbss`)
-- Program header layout (PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_GNU_STACK, PT_TLS)
-- Section and symbol string tables (auto-generated)
+- Program header synthesis (`PT_LOAD`, `PT_DYNAMIC`, `PT_INTERP`, `PT_GNU_STACK`, `PT_TLS`)
 - Custom program headers via `AddSegment`
+- GNU hash, SysV hash, and symbol versioning tables
+- Note sections (build ID, ABI tag, GNU properties)
 
-### Arch
-| Constant           | `e_machine`    |
-|--------------------|----------------|
-| `elf.ArchAMD64`    | `EM_X86_64`    |
-| `elf.ArchARM64`    | `EM_AARCH64`   |
-| `elf.ArchRISCV64`  | `EM_RISCV`     |
+**Architectures:**
+
+| Constant          | `e_machine`  |
+|-------------------|--------------|
+| `elf.ArchAMD64`   | `EM_X86_64`  |
+| `elf.ArchARM64`   | `EM_AARCH64` |
+| `elf.ArchRISCV64` | `EM_RISCV`   |
 
 ---
 
@@ -127,17 +120,15 @@ lazy binding stubs and GOT slots.
 ```go
 import "github.com/vertex-language/compiler/bin/pe"
 
-b := pe.NewBuilder(pe.ArchAMD64)
+b := pe.NewBuilder(pe.MachineAMD64)
 
 b.AddSection(pe.Section{
     Name:  ".text",
-    Chars: pe.IMAGE_SCN_CNT_CODE | pe.IMAGE_SCN_MEM_EXECUTE | pe.IMAGE_SCN_MEM_READ,
+    Chars: pe.ScnCode,
     Data:  machineCode,
-    Align: 16,
 })
 
 b.SetEntry("main")
-b.SetSubsystem(pe.SubsystemConsole)
 
 out, err := b.Emit()
 os.WriteFile("program.exe", out, 0o755)
@@ -160,32 +151,42 @@ b.AddImport(pe.Import{
 })
 ```
 
-The builder synthesizes `.idata`, `.edata`, `.reloc`, and `.debug` sections
-automatically.
+The builder synthesizes `.idata`, `.edata`, `.reloc`, `.pdata`/`.xdata`,
+`.tls`, `.debug`, and `.didat` sections automatically from high-level
+declarations.
 
-### Supported
+**Supported:**
 - PE32+ (64-bit) only
 - Executables and DLLs
-- Import Address Table (`.idata`) with name and ordinal imports
+- Standard and delay-load imports (`.idata`, `.didat`)
 - Export directory (`.edata`)
-- Base relocations (`.reloc`); required whenever `DYNAMIC_BASE` is set
-- Debug directory passthrough (`.debug`)
+- Base relocations (`.reloc`)
+- Exception unwind tables (`.pdata`/`.xdata`) via `PdataBuilder`
+- Thread-local storage (`.tls`) via `TLSBuilder`
+- Control Flow Guard load configuration
+- Debug directories (CodeView PDB, repro hash, VC features)
+- COFF object files via `ObjBuilder`
+- Static archives via `ArchiveBuilder`
+- Import libraries via `ImportLibBuilder`
 
-### Defaults
-| Setting              | Value                                          |
-|----------------------|------------------------------------------------|
-| Subsystem            | `SubsystemConsole`                             |
-| DllCharacteristics   | `HIGH_ENTROPY_VA \| DYNAMIC_BASE \| NX_COMPAT` |
-| Image base (EXE)     | `0x0000000140000000`                           |
-| Image base (DLL)     | `0x0000000180000000`                           |
-| Stack reserve/commit | 1 MiB / 4 KiB                                  |
-| Heap reserve/commit  | 1 MiB / 4 KiB                                  |
+**Defaults:**
 
-### Arch
-| Constant        | `Machine`                    |
-|-----------------|------------------------------|
-| `pe.ArchAMD64`  | `IMAGE_FILE_MACHINE_AMD64`   |
-| `pe.ArchARM64`  | `IMAGE_FILE_MACHINE_ARM64`   |
+| Setting              | Value                                                     |
+|----------------------|-----------------------------------------------------------|
+| Subsystem            | `SubsystemWindowsCUI` (console)                           |
+| DllCharacteristics   | `HIGH_ENTROPY_VA \| DYNAMIC_BASE \| NX_COMPAT \| GUARD_CF` |
+| Image base (EXE)     | `0x0000000140000000`                                      |
+| Image base (DLL)     | `0x0000000180000000`                                      |
+| Stack reserve/commit | 1 MiB / 4 KiB                                             |
+| Heap reserve/commit  | 1 MiB / 4 KiB                                             |
+| OS/Subsystem version | 6.0 (Windows Vista)                                       |
+
+**Architectures:**
+
+| Constant          | `Machine`                  |
+|-------------------|----------------------------|
+| `pe.MachineAMD64` | `IMAGE_FILE_MACHINE_AMD64` |
+| `pe.MachineARM64` | `IMAGE_FILE_MACHINE_ARM64` |
 
 ---
 
@@ -194,69 +195,68 @@ automatically.
 ```go
 import "github.com/vertex-language/compiler/bin/macho"
 
-b := macho.NewBuilder(macho.ArchAMD64)
+b := macho.NewBuilder(macho.ArchARM64)
+b.SetFileType(macho.FileTypeExecute)
+b.SetBuildVersion(macho.BuildVersion{
+    Platform: macho.PlatformMacOS,
+    MinOS:    macho.PackVersion(14, 0, 0),
+    SDK:      macho.PackVersion(14, 5, 0),
+})
+
+b.AddDylib(macho.DylibRef{
+    Path:           "/usr/lib/libSystem.B.dylib",
+    Kind:           macho.DylibLoad,
+    CurrentVersion: macho.PackVersion(1319, 0, 0),
+    CompatVersion:  macho.PackVersion(1, 0, 0),
+})
 
 b.AddSegment(macho.Segment{
-    Name: "__TEXT",
-    Prot: macho.ProtRead | macho.ProtExec,
+    Name:     "__TEXT",
+    InitProt: macho.ProtRead | macho.ProtExec,
     Sections: []macho.Section{
-        {Name: "__text", Data: machineCode, Align: 4},
+        {
+            Name:  "__text",
+            Data:  machineCode,
+            Align: 4,
+            Flags: macho.S_REGULAR | macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS,
+        },
     },
 })
 
-b.AddSymbol(macho.Symbol{
-    Name:        "_main",
-    SegmentName: "__TEXT",
-    SectionName: "__text",
-    Global:      true,
-})
-
+b.AddSymbol(macho.Symbol{Name: "_main", SegmentName: "__TEXT", SectionName: "__text", Global: true})
 b.SetEntry("_main")
 
 out, err := b.Emit()
 os.WriteFile("program", out, 0o755)
 ```
 
-Dynamic library dependencies are declared with `AddDylib`:
+`__PAGEZERO` and `__LINKEDIT` are synthesized automatically.
 
-```go
-b.AddDylib(macho.DylibRef{
-    Path:           "/usr/lib/libSystem.B.dylib",
-    CurrentVersion: 0x050F0400,
-    CompatVersion:  0x00010000,
-})
-```
+**Supported:**
+- 64-bit Mach-O only
+- Executables (`MH_EXECUTE`) and dynamic libraries (`MH_DYLIB`)
+- Legacy dyld info (`LC_DYLD_INFO_ONLY`) via `DyldInfoBuilder`
+- Modern chained fixups (`LC_DYLD_CHAINED_FIXUPS`, macOS 12+) via `ChainedFixupsBuilder`
+- Export trie (`LC_DYLD_EXPORTS_TRIE`) via `BuildExportTrie`
+- Function starts, data-in-code, code signature reservation
+- Build version, source version, UUID, rpath, linker options
+- Relocations for `MH_OBJECT` output
 
-A `__PAGEZERO` segment `[0, 4 GiB)` and a `__LINKEDIT` segment (symbol table,
-string table, relocations) are synthesized automatically. For dylib output,
-call `b.SetDylib()` before `Emit`.
+**Architectures:**
 
-### Supported
-- 64-bit Mach-O only (`MH_EXECUTE` and `MH_DYLIB`)
-- Load commands: `LC_SEGMENT_64`, `LC_SYMTAB`, `LC_DYSYMTAB`,
-  `LC_LOAD_DYLINKER`, `LC_LOAD_DYLIB`, `LC_MAIN`
-- Symbol and string tables (`__LINKEDIT`)
-- Section-level relocations
-
-### Arch
-| Constant             | `cputype`         |
-|----------------------|-------------------|
-| `macho.ArchAMD64`    | `CPU_TYPE_X86_64` |
-| `macho.ArchARM64`    | `CPU_TYPE_ARM64`  |
+| Constant           | `cputype`         |
+|--------------------|-------------------|
+| `macho.ArchAMD64`  | `CPU_TYPE_X86_64` |
+| `macho.ArchARM64`  | `CPU_TYPE_ARM64`  |
 
 ---
 
 ## Bootloader
 
 The `bootloader` namespace covers binary output that targets hardware directly
-rather than an operating system. It is split into two independent packages:
-`raw` for flat stage 1 binaries, and `uefi` for firmware-loaded UEFI images.
+rather than an operating system.
 
 ### raw
-
-```go
-import "github.com/vertex-language/compiler/bin/bootloader/raw"
-```
 
 Raw output is flat machine code at a fixed origin address — no file format
 header, no metadata, no wrapper of any kind. The CPU resets, jumps to a known
@@ -264,14 +264,11 @@ address, and starts executing bytes. This is always the format for stage 1
 bootloaders regardless of what comes after.
 
 ```go
+import "github.com/vertex-language/compiler/bin/bootloader/raw"
+
 b := raw.NewBuilder()
 b.SetOrigin(0x7C00)
-
-b.AddSection(raw.Section{
-    Data:  machineCode,
-    Align: 1,
-})
-
+b.AddSection(raw.Section{Data: machineCode, Align: 1})
 b.AddSymbol(raw.Symbol{Name: "entry", Offset: 0})
 b.SetBootSignature() // writes 0x55AA at bytes 510–511; implies PadSize(512)
 
@@ -283,39 +280,22 @@ os.WriteFile("stage1.bin", out, 0o644)
 resolved against it. `SetPadSize(n)` pads the output to exactly `n` bytes;
 `Emit` returns an error if the unpadded binary exceeds that size.
 
-### Relocations (raw)
-| Type       | Width  | Formula                                   |
-|------------|--------|-------------------------------------------|
-| `R_ABS8`   | 1 byte | `sym + addend`                            |
-| `R_ABS16`  | 2 byte | `sym + addend`                            |
-| `R_ABS32`  | 4 byte | `sym + addend`                            |
-| `R_REL8`   | 1 byte | `sym − (patch + 1) + addend`              |
-| `R_REL16`  | 2 byte | `sym − (patch + 2) + addend`              |
-| `R_REL32`  | 4 byte | `sym − (patch + 4) + addend`              |
-| `R_SEG16`  | 2 byte | `(sym + addend) >> 4` (real-mode segment) |
-
----
-
 ### uefi
+
+UEFI executables are PE32+ images loaded by platform firmware before any OS
+is present. `uefi.NewBuilder` enforces all required UEFI constraints: EFI
+subsystem, mandatory base relocations, W^X section policy, and a minimal
+64-byte MZ stub.
 
 ```go
 import "github.com/vertex-language/compiler/bin/bootloader/uefi"
-```
 
-UEFI executables are PE32+ binaries loaded by the platform firmware before
-any OS is present. `uefi.NewBuilder` produces a valid UEFI image with the
-required constraints enforced: EFI subsystem, mandatory base relocations so
-firmware can load the image at any address, and a minimal 64-byte MZ stub
-(no MS-DOS program bytes).
-
-```go
 b := uefi.NewBuilder(uefi.ArchAMD64, uefi.SubsystemEFIApplication)
 
 b.AddSection(uefi.Section{
     Name:  ".text",
     Chars: uefi.IMAGE_SCN_CNT_CODE | uefi.IMAGE_SCN_MEM_EXECUTE | uefi.IMAGE_SCN_MEM_READ,
     Data:  machineCode,
-    // Annotate every 64-bit absolute pointer for .reloc generation:
     Relocs: []uefi.Reloc{
         {Offset: ptrOffset, Type: uefi.IMAGE_REL_BASED_DIR64},
     },
@@ -327,88 +307,39 @@ out, err := b.Emit()
 os.WriteFile("bootx64.efi", out, 0o755)
 ```
 
-The `.reloc` section is always emitted, even when there are no annotated
-relocations, because UEFI firmware requires the base-relocation data
-directory entry to be present and valid.
+The `.reloc` section is always emitted — UEFI firmware requires the
+base-relocation data directory entry to be present and valid even when there
+are no relocations. UEFI images do not use DLL imports; all firmware services
+arrive through the `EFI_SYSTEM_TABLE` pointer passed to the entry point.
 
-The builder always enforces:
-- `DYNAMIC_BASE | NX_COMPAT | NO_SEH` in `DllCharacteristics`
-- `SectionAlignment` fixed at 4096 (UEFI CA memory-mitigation requirement)
-- No section may combine `IMAGE_SCN_MEM_WRITE` and `IMAGE_SCN_MEM_EXECUTE`
-
-UEFI images do not use DLL imports — all firmware services are accessed
-through the `EFI_SYSTEM_TABLE` pointer passed to the entry point.
-
-#### Subsystems
-| Constant                              | Use                                        |
-|---------------------------------------|--------------------------------------------|
-| `uefi.SubsystemEFIApplication`        | Bootloaders, boot managers                 |
-| `uefi.SubsystemEFIBootService`        | Boot-time drivers                          |
-| `uefi.SubsystemEFIRuntime`            | Drivers that survive `ExitBootServices`    |
-
-#### Arch
-| Constant           | Machine                        |
-|--------------------|--------------------------------|
-| `uefi.ArchAMD64`   | `IMAGE_FILE_MACHINE_AMD64`     |
-| `uefi.ArchARM64`   | `IMAGE_FILE_MACHINE_ARM64`     |
+| Subsystem constant                 | Use                                     |
+|------------------------------------|-----------------------------------------|
+| `uefi.SubsystemEFIApplication`     | Bootloaders, boot managers              |
+| `uefi.SubsystemEFIBootService`     | Boot-time drivers                       |
+| `uefi.SubsystemEFIRuntime`         | Drivers that survive `ExitBootServices` |
 
 ---
 
 ## Relocations
 
 Relocations are format- and arch-specific. Each sub-package defines its own
-relocation type constants. Relocations are only needed if you are managing
-cross-section references yourself — if you came through the `linker` package,
-relocations are already applied and the sections it hands to `bin` carry
-patched data.
+relocation type constants. Relocations are only needed when managing
+cross-section references directly — code coming through the `linker` package
+arrives with relocations already applied.
 
 ```go
-// ELF AMD64
+// ELF AMD64 — PC-relative call
 elf.Reloc{Section: ".text", Offset: 12, Symbol: "puts", Type: elf.R_X86_64_PLT32, Addend: -4}
 
-// PE AMD64
-pe.Reloc{Section: ".text", Offset: 8, Symbol: "ExitProcess", Type: pe.IMAGE_REL_AMD64_REL32}
+// PE AMD64 — PC-relative call
+pe.COFFReloc{Offset: 8, SymbolIndex: 1, Type: pe.IMAGE_REL_AMD64_REL32}
 
-// Mach-O ARM64
-macho.Reloc{Section: "__text", Offset: 4, Symbol: "_printf", Type: uint8(macho.ARM64_RELOC_BRANCH26),
-    PCRel: true, Length: 2, Extern: true}
+// Mach-O ARM64 — branch
+macho.Reloc{Section: "__text", Offset: 4, Symbol: "_printf",
+    Type: uint8(macho.ARM64_RELOC_BRANCH26), PCRel: true, Length: 2, Extern: true}
 
-// raw (flat binary)
-raw.Reloc{Section: ".text", Offset: 1, Symbol: "entry", Type: raw.R_REL8}
-```
-
----
-
-## Package layout
-
-```
-github.com/vertex-language/compiler/bin/
-├── elf/
-│   ├── builder.go      # Builder, Emit
-│   ├── sections.go     # Section, Symbol, Reloc, all ELF constants
-│   ├── program.go      # Segment / custom program header
-│   ├── dynamic.go      # DynBuilder: PLT, GOT, RELA, .dynamic
-│   ├── reloc_amd64.go  # R_X86_64_* constants
-│   └── reloc_arm64.go  # R_AARCH64_* constants
-├── pe/
-│   ├── builder.go      # Builder, Emit
-│   ├── sections.go     # Section, Symbol, Reloc, all PE constants
-│   ├── iat.go          # buildIDATA — Import Address Table
-│   └── reloc_amd64.go  # IMAGE_REL_AMD64_* constants
-├── macho/
-│   ├── builder.go      # Builder, Emit
-│   ├── segments.go     # Segment, Section, Symbol, Reloc, DylibRef, Prot, S_* flags
-│   ├── commands.go     # Load command serialization helpers
-│   ├── reloc_arm64.go  # ARM64_RELOC_* and X86_64_RELOC_* constants
-└── bootloader/
-    ├── raw/
-    │   ├── builder.go  # Builder, Emit
-    │   ├── sections.go # Section, Symbol
-    │   └── reloc.go    # Reloc, RelocType, R_ABS*, R_REL*, R_SEG16
-    └── uefi/
-        ├── builder.go  # Builder, Emit
-        ├── sections.go # Section, Reloc, Subsystem, IMAGE_SCN_* flags
-        └── reloc.go    # buildReloc, IMAGE_REL_BASED_* constants
+// raw — absolute 16-bit
+raw.Reloc{Section: ".text", Offset: 1, Symbol: "entry", Type: raw.R_ABS16}
 ```
 
 ---

@@ -15,9 +15,7 @@ import (
 
 	"github.com/vertex-language/compiler"
 	"github.com/vertex-language/compiler/encoder"
-	"github.com/vertex-language/compiler/linker"
-	"github.com/vertex-language/compiler/memory"
-	"github.com/vertex-language/compiler/object"
+	"github.com/vertex-language/compiler/linker/elf"
 	"github.com/vertex-language/compiler/wasm"
 )
 
@@ -40,25 +38,48 @@ func main() {
 
 	// ──────────────────────────────────────────────────────────────────────────
 
-	// Compile the wasm module. 
-	// Under the new architecture, the compilation driver automatically detects 
-	// "memory" imports and injects the allocator stubs directly into the shared object.
+	// 1. Compile the Wasm module.
+	// The compilation driver automatically detects "memory" imports and 
+	// injects the allocator stubs directly into the generated object.
 	obj, err := compiler.CompileWith(m, compiler.Options{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "compile: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("compiled %5d B  %d syms  %d relocs\n",
-		len(obj.Code), len(obj.Symbols), len(obj.Relocs))
+	// 2. Emit the native object bytes (ELF64 ET_REL format).
+	objBytes, err := obj.Emit()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "emit object: %v\n", err)
+		os.Exit(1)
+	}
 
-	// Link the single unified object into a Linux ELF binary.
-	bin, err := linker.Link(
-		[]*object.WasmObj{obj},
-		linker.Options{Output: linker.ELF, Entry: "main"},
-	)
+	// 3. Parse the emitted object bytes for the linker.
+	parsedObj, err := elf.ParseObject(objBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse object: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("compiled:  %d sections  %d symbols  %d relocations\n",
+		len(parsedObj.Sections), len(parsedObj.Symbols), len(parsedObj.Relocs))
+
+	// 4. Setup the ELF Linker for AMD64.
+	lnk := elf.NewLinker(elf.EM_X86_64) // 0x3E
+	lnk.SetEntry("main")
+	lnk.AddObject(parsedObj)
+
+	// 5. Run the linker phases (resolution, merging, layout, patching).
+	result, err := lnk.Link()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "link: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 6. Build and emit the final executable Linux ELF binary.
+	bin, err := result.Builder().Emit()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build elf: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -74,7 +95,7 @@ func main() {
 // Import order defines the function index space; locals follow.
 
 const (
-	fnWrite      = uint32(0) // linux:kernel/syscalls  write
+	fnWrite      = uint32(0) // linux/kernel/syscalls  write
 	fnHeapAlloc  = uint32(1) // memory  heap.alloc
 	fnHeapFree   = uint32(2) // memory  heap.free
 	fnArenaPush  = uint32(3) // memory  arena.push
@@ -112,16 +133,17 @@ func buildModule() *wasm.Module {
 	// ── Imports ───────────────────────────────────────────────────────────────
 
 	// Syscall: write(fd, buf ptr, count) → bytes_written
-	m.Imports.AddFunc("linux:kernel/syscalls", "write@i32.ptr.i32", tWrite)
+	// Note: Updated the namespace to use '/' instead of ':' per abi.go routing rules.
+	m.Imports.AddFunc("linux/kernel/syscalls", "write@i32.ptr.i32", tWrite)
 
 	// Heap allocator.
-	m.Imports.AddFunc(memory.ImportModule, "heap.alloc", tAlloc)
-	m.Imports.AddFunc(memory.ImportModule, "heap.free",  tFree)
+	m.Imports.AddFunc("memory", "heap.alloc", tAlloc)
+	m.Imports.AddFunc("memory", "heap.free", tFree)
 
 	// Arena (bump / stack) allocator.
-	m.Imports.AddFunc(memory.ImportModule, "arena.push",  tVoid)
-	m.Imports.AddFunc(memory.ImportModule, "arena.pop",   tVoid)
-	m.Imports.AddFunc(memory.ImportModule, "arena.alloc", tAlloc)
+	m.Imports.AddFunc("memory", "arena.push", tVoid)
+	m.Imports.AddFunc("memory", "arena.pop", tVoid)
+	m.Imports.AddFunc("memory", "arena.alloc", tAlloc)
 
 	// ── Local function, memory, exports ───────────────────────────────────────
 
@@ -172,11 +194,11 @@ func codeMain() *wasm.FunctionBody {
 
 	// ── write ─────────────────────────────────────────────────────────────────
 
-	b.I32Const(1)                    // fd = stdout
-	b.I32Const(msgOff)               // buf offset in linear memory
-	b.I32Const(int32(len(msg)))      // byte count
+	b.I32Const(1)               // fd = stdout
+	b.I32Const(msgOff)          // buf offset in linear memory
+	b.I32Const(int32(len(msg))) // byte count
 	b.Call(fnWrite)
-	b.Drop()                         // discard return value
+	b.Drop() // discard return value
 
 	// ── return ────────────────────────────────────────────────────────────────
 

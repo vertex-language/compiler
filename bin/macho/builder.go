@@ -5,61 +5,240 @@ import (
 	"fmt"
 )
 
-const (
-	// pageSize is the VM page size used for segment alignment on both AMD64 and ARM64 macOS.
-	pageSize uint64 = 0x4000 // 16 KiB (ARM64 native; x86-64 accepts it too)
+// ──────────────────────────────────────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────────────────────────────────────
 
-	// loadAddressExecutable is the conventional base address for position-dependent executables.
-	// PIE executables are loaded at a kernel-chosen address; __PAGEZERO still occupies [0, baseVA).
+const (
+	// PageSize is the VM page / segment alignment used on both AMD64 and ARM64
+	// macOS.  16 KiB is the ARM64 native page; x86-64 accepts it without issue.
+	// Exported so that linker packages can use the same value when computing
+	// chained-fixup page-start arrays and layout arithmetic.
+	PageSize uint64 = 0x4000
+
+	// baseVA is the conventional load address for the first user segment.
+	// __PAGEZERO occupies [0, baseVA).
 	baseVA uint64 = 0x100000000 // 4 GiB — standard macOS convention
 
-	// dylinkerPath is the runtime dynamic linker.
 	dylinkerPath = "/usr/lib/dyld"
 )
 
-// Builder accumulates segments, symbols, dylib references, and an entry
-// point, then serialises them all into a complete 64-bit Mach-O binary via
-// Emit.
+// ──────────────────────────────────────────────────────────────────────────────
+// DyldMode selects which dynamic-linking load commands are emitted.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// DyldMode selects the dynamic-linking infrastructure emitted into __LINKEDIT.
+type DyldMode uint8
+
+const (
+	// DyldModeLegacy emits LC_DYLD_INFO_ONLY (macOS < 12 / iOS < 14).
+	DyldModeLegacy DyldMode = iota
+	// DyldModeChained emits LC_DYLD_CHAINED_FIXUPS + LC_DYLD_EXPORTS_TRIE
+	// (macOS 12+ / iOS 14+).  Default for new builds.
+	DyldModeChained
+)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Builder
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Builder accumulates segments, symbols, dylib references, metadata, and
+// dynamic-linking tables, then serialises them into a complete 64-bit Mach-O
+// image via Emit.
+//
+// Workflow for a dynamically linked executable:
+//
+//	b := macho.NewBuilder(macho.ArchARM64)
+//	b.SetFileType(macho.FileTypeExecute)
+//	b.SetBuildVersion(macho.BuildVersion{
+//	    Platform: macho.PlatformMacOS,
+//	    MinOS: macho.PackVersion(14, 0, 0),
+//	    SDK:   macho.PackVersion(14, 5, 0),
+//	})
+//	b.AddDylib(macho.DylibRef{Path: "/usr/lib/libSystem.B.dylib", Kind: macho.DylibLoad, ...})
+//	b.AddSegment(textSeg)
+//	b.AddSegment(dataSeg)
+//	b.SetEntry("_main")
+//	b.SetChainedFixups(cfBuilder)
+//	b.SetExportsTrie(BuildExportTrie(exports))
+//	out, err := b.Emit()
 type Builder struct {
 	arch     Arch
+	fileType FileType
+	flags    MHFlags
+
 	segments []Segment
 	dylibs   []DylibRef
 	symbols  []Symbol
-	entry    string // symbol name of the entry point
-	isDylib  bool   // emit MH_DYLIB instead of MH_EXECUTE
+
+	// Dylib identity for MH_DYLIB / MH_BUNDLE output.
+	dylibID *DylibRef
+
+	// Entry point (MH_EXECUTE / MH_KEXT_BUNDLE).
+	entry string
+
+	// Metadata load commands.
+	buildVersion  *BuildVersion
+	sourceVersion uint64 // packed A.B.C.D.E; 0 = omit
+	uuid          *[16]byte
+	rpaths        []string
+
+	// LC_LINKER_OPTION strings (e.g. "-framework", "Foundation").
+	linkerOptions [][]string
+
+	// Dynamic linking mode.
+	dyldMode DyldMode
+
+	// Legacy: LC_DYLD_INFO_ONLY blobs (set via SetDyldInfo).
+	legacyRebase   []byte
+	legacyBind     []byte
+	legacyWeakBind []byte
+	legacyLazyBind []byte
+	legacyExport   []byte
+
+	// Modern: LC_DYLD_CHAINED_FIXUPS blob (set via SetChainedFixups).
+	chainedFixupsData []byte
+	// Modern: LC_DYLD_EXPORTS_TRIE blob (set via SetExportsTrie).
+	exportsTrie []byte
+
+	// LC_FUNCTION_STARTS blob (built via SetFunctionStarts).
+	functionStarts []byte
+
+	// LC_DATA_IN_CODE entries.
+	dataInCode []DataInCodeEntry
+
+	// LC_CODE_SIGNATURE: size reserved in __LINKEDIT (actual signing is external).
+	codeSignatureSize uint32
 }
 
 // NewBuilder returns a Builder targeting the given architecture.
+// The default file type is FileTypeExecute.
 func NewBuilder(arch Arch) *Builder {
-	return &Builder{arch: arch}
+	return &Builder{
+		arch:     arch,
+		fileType: FileTypeExecute,
+		dyldMode: DyldModeChained,
+	}
 }
 
+// ── File type and flags ──────────────────────────────────────────────────────
+
+// SetFileType sets the Mach-O file type.  Must be called before Emit.
+func (b *Builder) SetFileType(ft FileType) { b.fileType = ft }
+
+// SetFlags replaces the header flags.  The Builder will OR in required flags
+// (MHDyldLink, MHTwoLevel, MHPie, etc.) automatically; this is for extra flags
+// you need to set explicitly.
+func (b *Builder) SetFlags(f MHFlags) { b.flags = f }
+
+// ── Segments and sections ────────────────────────────────────────────────────
+
 // AddSegment appends a segment (and all its sections) to the image.
-// Segments are emitted in the order they are added; __TEXT should come first.
+// Segments are emitted in the order added; __TEXT should come first,
+// followed by __DATA_CONST, __DATA, and any others.
+// __PAGEZERO and __LINKEDIT are synthesised automatically.
 func (b *Builder) AddSegment(seg Segment) {
 	b.segments = append(b.segments, seg)
 }
 
-// AddDylib records a dynamic library to be loaded at runtime (LC_LOAD_DYLIB).
+// ── Dynamic libraries ────────────────────────────────────────────────────────
+
+// AddDylib records a dynamic library dependency (LC_LOAD_DYLIB and variants).
+// The order of calls determines the 1-based dylib ordinal used in bind tables.
 func (b *Builder) AddDylib(ref DylibRef) {
 	b.dylibs = append(b.dylibs, ref)
 }
 
+// SetDylibID sets the identity of this image when building a dylib or bundle
+// (LC_ID_DYLIB).  Has no effect on MH_EXECUTE output.
+func (b *Builder) SetDylibID(ref DylibRef) {
+	b.dylibID = &ref
+}
+
+// ── Symbols ──────────────────────────────────────────────────────────────────
+
 // AddSymbol adds an entry to the symbol table.
+// Local symbols must be added before global symbols.
 func (b *Builder) AddSymbol(sym Symbol) {
 	b.symbols = append(b.symbols, sym)
 }
 
-// SetEntry names the entry-point symbol. The symbol must resolve to a
-// location within one of the added segments.
-func (b *Builder) SetEntry(name string) {
-	b.entry = name
+// ── Entry point ──────────────────────────────────────────────────────────────
+
+// SetEntry names the entry-point symbol (LC_MAIN).  Required for MH_EXECUTE.
+// The symbol must be present in the symbol table with a valid section.
+func (b *Builder) SetEntry(name string) { b.entry = name }
+
+// ── Metadata ─────────────────────────────────────────────────────────────────
+
+// SetBuildVersion sets LC_BUILD_VERSION (platform, minimum OS, SDK, tools).
+func (b *Builder) SetBuildVersion(bv BuildVersion) { b.buildVersion = &bv }
+
+// SetSourceVersion sets LC_SOURCE_VERSION.
+// Use PackSourceVersion to construct the uint64 value.
+func (b *Builder) SetSourceVersion(v uint64) { b.sourceVersion = v }
+
+// SetUUID embeds a UUID into LC_UUID.
+// If never called the Builder omits LC_UUID; callers should generate a random UUID.
+func (b *Builder) SetUUID(uuid [16]byte) { b.uuid = &uuid }
+
+// AddRpath appends an LC_RPATH search path, e.g. "@executable_path/../Frameworks".
+func (b *Builder) AddRpath(path string) { b.rpaths = append(b.rpaths, path) }
+
+// AddLinkerOption appends one LC_LINKER_OPTION record (a slice of option strings,
+// e.g. []string{"-framework", "Foundation"}).
+func (b *Builder) AddLinkerOption(opts []string) {
+	b.linkerOptions = append(b.linkerOptions, opts)
 }
 
-// SetDylib switches the output file type to MH_DYLIB.
-func (b *Builder) SetDylib() {
-	b.isDylib = true
+// ── Dynamic linking ──────────────────────────────────────────────────────────
+
+// SetDyldMode selects whether to emit legacy (LC_DYLD_INFO_ONLY) or modern
+// (LC_DYLD_CHAINED_FIXUPS + LC_DYLD_EXPORTS_TRIE) dynamic-linking commands.
+// Default is DyldModeChained.
+func (b *Builder) SetDyldMode(m DyldMode) { b.dyldMode = m }
+
+// SetDyldInfo supplies pre-built blobs for LC_DYLD_INFO_ONLY (legacy mode).
+// Use DyldInfoBuilder.Build() to produce the blobs.
+func (b *Builder) SetDyldInfo(rebase, bind, weakBind, lazyBind, exportTrie []byte) {
+	b.legacyRebase = rebase
+	b.legacyBind = bind
+	b.legacyWeakBind = weakBind
+	b.legacyLazyBind = lazyBind
+	b.legacyExport = exportTrie
+	b.dyldMode = DyldModeLegacy
 }
+
+// SetChainedFixups supplies a pre-built LC_DYLD_CHAINED_FIXUPS blob (modern mode).
+// Use ChainedFixupsBuilder.Build() to produce the blob.
+func (b *Builder) SetChainedFixups(data []byte) {
+	b.chainedFixupsData = data
+	b.dyldMode = DyldModeChained
+}
+
+// SetExportsTrie supplies a pre-built LC_DYLD_EXPORTS_TRIE blob (modern mode).
+// Use BuildExportTrie() to produce the blob.
+func (b *Builder) SetExportsTrie(data []byte) {
+	b.exportsTrie = data
+}
+
+// ── Linkedit extras ──────────────────────────────────────────────────────────
+
+// SetFunctionStarts supplies the LC_FUNCTION_STARTS blob.
+// Use BuildFunctionStarts() to produce it.
+func (b *Builder) SetFunctionStarts(data []byte) { b.functionStarts = data }
+
+// AddDataInCode appends a DataInCodeEntry for LC_DATA_IN_CODE.
+func (b *Builder) AddDataInCode(e DataInCodeEntry) { b.dataInCode = append(b.dataInCode, e) }
+
+// ReserveCodeSignature reserves space in __LINKEDIT for an ad-hoc or
+// post-processed code signature of the given byte size.  The actual signature
+// bytes are written by the caller after Emit returns (e.g. using codesign(1)).
+func (b *Builder) ReserveCodeSignature(size uint32) { b.codeSignatureSize = size }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Emit
+// ──────────────────────────────────────────────────────────────────────────────
 
 // Emit serialises the complete Mach-O image and returns the raw bytes.
 func (b *Builder) Emit() ([]byte, error) {
@@ -67,135 +246,170 @@ func (b *Builder) Emit() ([]byte, error) {
 		return nil, err
 	}
 
-	// ------------------------------------------------------------------ //
-	// Phase 1: lay out the load-command region so we know its total size.
-	// We do a dry run that just counts bytes; no data is written yet.
-	// ------------------------------------------------------------------ //
-	lcSize, err := b.computeLoadCommandSize()
-	if err != nil {
-		return nil, err
-	}
-
-	// The load commands immediately follow the Mach-O header.
+	// ── Phase 1: dry-run load-command size ────────────────────────────────────
+	lcSize := b.computeLoadCommandSize()
 	headerAndLC := uint64(sizeofMachHeader64) + lcSize
 
-	// ------------------------------------------------------------------ //
-	// Phase 2: assign file offsets and virtual addresses to each section.
-	// ------------------------------------------------------------------ //
+	// ── Phase 2: assign file offsets and VAs to each section ─────────────────
 	type sectionLayout struct {
 		segIdx  int
 		sectIdx int
 		fileOff uint64
 		vmAddr  uint64
-		size    uint64
+		size    uint64 // byte count (0 for zerofill)
 	}
 
-	// fileOff starts right after the header + load commands.
-	fileOff := alignUp(headerAndLC, pageSize)
+	fileOff := alignUp(headerAndLC, PageSize) // ← was pageSize
 	vmAddr := baseVA
-
-	// __PAGEZERO: a read-none zero-fill segment [0, baseVA).  We synthesise
-	// it automatically for executables so callers do not have to add it.
-	// It does not occupy file space.
 
 	var layouts []sectionLayout
 
-	// Build a flat list of sections across all segments.
-	for si, seg := range b.segments {
-		// Each segment starts on a page boundary in both file and VM space.
-		segFileStart := fileOff
-		segVMStart := vmAddr
+	// Track per-segment file/VM extents for the segment command.
+	type segExtent struct {
+		vmStart, vmEnd, fileStart, fileEnd uint64
+		set                                bool
+	}
+	segExtents := make([]segExtent, len(b.segments))
 
+	for si, seg := range b.segments {
 		for ki, sect := range seg.Sections {
 			a := uint64(sect.Align)
 			if a < 1 {
 				a = 1
 			}
+			isZerofill := (sect.Flags & 0xff) == S_ZEROFILL ||
+				(sect.Flags&0xff) == S_GB_ZEROFILL ||
+				(sect.Flags&0xff) == S_THREAD_LOCAL_ZEROFILL
+
 			fileOff = alignUp(fileOff, a)
 			vmAddr = alignUp(vmAddr, a)
 
-			layouts = append(layouts, sectionLayout{
+			sz := uint64(len(sect.Data))
+			if isZerofill && sz == 0 {
+				sz = sect.Size
+			}
+
+			l := sectionLayout{
 				segIdx:  si,
 				sectIdx: ki,
 				fileOff: fileOff,
 				vmAddr:  vmAddr,
-				size:    uint64(len(sect.Data)),
-			})
+				size:    sz,
+			}
+			layouts = append(layouts, l)
 
-			fileOff += uint64(len(sect.Data))
-			vmAddr += uint64(len(sect.Data))
+			// Update segment extents.
+			e := &segExtents[si]
+			if !e.set {
+				e.vmStart = vmAddr
+				e.fileStart = fileOff
+				e.set = true
+			}
+			vmEnd := vmAddr + sz
+			if vmEnd > e.vmEnd {
+				e.vmEnd = vmEnd
+			}
+			fileEndForSect := fileOff
+			if !isZerofill {
+				fileEndForSect = fileOff + sz
+			}
+			if fileEndForSect > e.fileEnd {
+				e.fileEnd = fileEndForSect
+			}
+
+			if !isZerofill {
+				fileOff += sz
+			}
+			vmAddr += sz
 		}
-
-		// Unused if the segment has no sections; avoids "declared but unused" warnings.
-		_ = segFileStart
-		_ = segVMStart
 	}
 
-	// ------------------------------------------------------------------ //
-	// Phase 3: build the symbol and string tables.
-	// ------------------------------------------------------------------ //
-	// Symbol table layout: locals first, then external defs, then undefs
-	// (required by LC_DYSYMTAB).
+	// ── Phase 3: build symbol and string tables ───────────────────────────────
 	type symEntry struct {
-		strx   uint32
-		ntype  uint8
-		nsect  uint8 // 1-based section index, 0 = NO_SECT
-		ndesc  uint16
-		value  uint64
-		global bool
+		strx  uint32
+		ntype uint8
+		nsect uint8
+		ndesc uint16
+		value uint64
 	}
 
-	// Build a string table.  Index 0 is always a NUL byte.
 	strTable := []byte{0}
-	addString := func(s string) uint32 {
+	addStr := func(s string) uint32 {
 		idx := uint32(len(strTable))
 		strTable = append(strTable, []byte(s)...)
 		strTable = append(strTable, 0)
 		return idx
 	}
 
-	// Build a flat section index (1-based) for symbol resolution.
-	type flatSection struct {
+	// Build flat section list for 1-based index lookup.
+	type flatSect struct {
 		segName  string
 		sectName string
 		vmAddr   uint64
 	}
-	var flatSects []flatSection
+	var flatSects []flatSect
 	for si, seg := range b.segments {
 		for ki := range seg.Sections {
-			l := layoutFor(layouts, si, ki)
-			flatSects = append(flatSects, flatSection{
+			var l sectionLayout
+			for _, ll := range layouts {
+				if ll.segIdx == si && ll.sectIdx == ki {
+					l = ll
+					break
+				}
+			}
+			flatSects = append(flatSects, flatSect{
 				segName:  seg.Name,
 				sectName: seg.Sections[ki].Name,
 				vmAddr:   l.vmAddr,
 			})
 		}
 	}
-	sectionIndex := func(segName, sectName string) uint8 {
+	sectIndex := func(segName, sectName string) uint8 {
 		for i, fs := range flatSects {
 			if fs.segName == segName && fs.sectName == sectName {
-				return uint8(i + 1) // 1-based
+				return uint8(i + 1)
 			}
 		}
-		return 0 // NO_SECT
+		return 0
 	}
 
 	var localSyms, extSyms []symEntry
 	for _, sym := range b.symbols {
-		strx := addString(sym.Name)
-		nsect := sectionIndex(sym.SegmentName, sym.SectionName)
+		strx := addStr(sym.Name)
+		nsect := sectIndex(sym.SegmentName, sym.SectionName)
 		ntype := nSect
 		if nsect == 0 {
 			ntype = nUndf
 		}
-		e := symEntry{
-			strx:   strx,
-			ntype:  ntype,
-			nsect:  nsect,
-			value:  sym.Value,
-			global: sym.Global,
+		if sym.PrivateExtern {
+			ntype |= nPExt
 		}
-		if sym.Global {
+		ndesc := sym.Desc
+		if sym.Weak && nsect != 0 {
+			ndesc |= nDescWeakDef
+		}
+		if sym.Weak && nsect == 0 {
+			ndesc |= nDescWeakRef
+		}
+		if sym.AltEntry {
+			ndesc |= nDescAltEntry
+		}
+
+		// Resolve value: if the symbol has a section, value is relative to
+		// section start; we convert to absolute VA.
+		value := sym.Value
+		if nsect != 0 {
+			value += flatSects[nsect-1].vmAddr
+		}
+
+		e := symEntry{
+			strx:  strx,
+			ntype: ntype,
+			nsect: nsect,
+			ndesc: ndesc,
+			value: value,
+		}
+		if sym.Global || sym.PrivateExtern {
 			e.ntype |= nExt
 			extSyms = append(extSyms, e)
 		} else {
@@ -204,20 +418,17 @@ func (b *Builder) Emit() ([]byte, error) {
 	}
 	allSyms := append(localSyms, extSyms...)
 
-	// Pad string table to 8-byte boundary.
 	for len(strTable)%8 != 0 {
 		strTable = append(strTable, 0)
 	}
 
-	// ------------------------------------------------------------------ //
-	// Phase 4: collect relocations.
-	// ------------------------------------------------------------------ //
+	// ── Phase 4: collect relocations ─────────────────────────────────────────
 	type sectReloc struct {
-		sectFlatIdx int
-		relocs      []Reloc
+		flatIdx int
+		relocs  []Reloc
 	}
 	var allRelocs []sectReloc
-	symNameToIdx := func(name string) uint32 {
+	symNameIdx := func(name string) uint32 {
 		for i, sym := range b.symbols {
 			if sym.Name == name {
 				return uint32(i)
@@ -230,188 +441,295 @@ func (b *Builder) Emit() ([]byte, error) {
 			if len(sect.Relocs) == 0 {
 				continue
 			}
-			fi := flatSectIdx(flatSects, seg.Name, sect.Name)
+			fi := -1
+			for i, fs := range flatSects {
+				if fs.segName == seg.Name && fs.sectName == sect.Name {
+					fi = i
+					break
+				}
+			}
 			_ = si
 			_ = ki
-			allRelocs = append(allRelocs, sectReloc{fi, sect.Relocs})
+			if fi >= 0 {
+				allRelocs = append(allRelocs, sectReloc{fi, sect.Relocs})
+			}
 		}
 	}
-	_ = symNameToIdx
 
-	// ------------------------------------------------------------------ //
-	// Phase 5: assign file offsets to __LINKEDIT data.
-	// ------------------------------------------------------------------ //
-	// __LINKEDIT is always the last segment.  Its contents (in order):
-	//   relocation entries, symbol table, string table.
-	linkeditFileStart := alignUp(fileOff, pageSize)
+	// ── Phase 5: build indirect symbol table ─────────────────────────────────
+	var indirectSyms []uint32
 
-	// Relocations.
-	relocFileOff := linkeditFileStart
-	relocTotalBytes := uint64(0)
-	for _, sr := range allRelocs {
-		_ = sr
-		relocTotalBytes += uint64(len(sr.relocs)) * uint64(sizeofRelocEntry)
+	for _, seg := range b.segments {
+		for _, sect := range seg.Sections {
+			stype := sect.Flags & 0xff
+			if stype == S_SYMBOL_STUBS ||
+				stype == S_NON_LAZY_SYMBOL_POINTERS ||
+				stype == S_LAZY_SYMBOL_POINTERS ||
+				stype == S_LAZY_DYLIB_SYMBOL_POINTERS {
+				entrySize := uint64(8)
+				if stype == S_SYMBOL_STUBS && sect.Reserved2 > 0 {
+					entrySize = uint64(sect.Reserved2)
+				}
+				sz := uint64(len(sect.Data))
+				if sz == 0 {
+					sz = sect.Size
+				}
+				count := uint64(0)
+				if entrySize > 0 {
+					count = sz / entrySize
+				}
+				for i := uint64(0); i < count; i++ {
+					indirectSyms = append(indirectSyms, 0)
+				}
+			}
+		}
 	}
 
-	symFileOff := relocFileOff + relocTotalBytes
-	symFileOff = alignUp(symFileOff, 8)
-	symBytes := uint64(len(allSyms)) * uint64(sizeofNlist64)
+	// ── Phase 6: assign __LINKEDIT offsets ───────────────────────────────────
+	linkeditFileStart := alignUp(fileOff, PageSize) // ← was pageSize
+	linkeditVMAddr := alignUp(vmAddr, PageSize)     // ← was pageSize
 
-	strFileOff := symFileOff + symBytes
+	cur := linkeditFileStart
 
-	linkeditSize := strFileOff + uint64(len(strTable)) - linkeditFileStart
-	linkeditVMAddr := alignUp(vmAddr, pageSize)
+	var (
+		rebaseOff, rebaseSz             uint32
+		bindOff, bindSz                 uint32
+		weakBindOff, weakBindSz         uint32
+		lazyBindOff, lazyBindSz         uint32
+		exportOff, exportSz             uint32
+		chainedFixupsOff, chainedFixupsSz uint32
+		exportTrieOff, exportTrieSz     uint32
+		funcStartsOff, funcStartsSz     uint32
+		dataInCodeOff, dataInCodeSz     uint32
+		symOff, symSz                   uint32
+		indirSymOff, indirSymSz         uint32
+		strOff                          uint32
+		codeSignOff                     uint32
+	)
 
-	// ------------------------------------------------------------------ //
-	// Phase 6: resolve entry-point file offset for LC_MAIN.
-	// ------------------------------------------------------------------ //
+	assign := func(data []byte, off *uint32, sz *uint32, align uint64) {
+		if len(data) == 0 {
+			*off = 0
+			*sz = 0
+			return
+		}
+		cur = alignUp(cur, align)
+		*off = uint32(cur)
+		*sz = uint32(len(data))
+		cur += uint64(len(data))
+	}
+
+	if b.dyldMode == DyldModeLegacy {
+		assign(b.legacyRebase, &rebaseOff, &rebaseSz, 8)
+		assign(b.legacyBind, &bindOff, &bindSz, 1)
+		assign(b.legacyWeakBind, &weakBindOff, &weakBindSz, 1)
+		assign(b.legacyLazyBind, &lazyBindOff, &lazyBindSz, 1)
+		assign(b.legacyExport, &exportOff, &exportSz, 8)
+	} else {
+		assign(b.chainedFixupsData, &chainedFixupsOff, &chainedFixupsSz, 8)
+		assign(b.exportsTrie, &exportTrieOff, &exportTrieSz, 8)
+	}
+
+	assign(b.functionStarts, &funcStartsOff, &funcStartsSz, 8)
+
+	// data_in_code blob.
+	var dicBlob []byte
+	for _, e := range b.dataInCode {
+		dicBlob = append(dicBlob, make([]byte, sizeofDataInCodeEntry)...)
+		emitDataInCodeEntry(dicBlob, len(dicBlob)-sizeofDataInCodeEntry, e)
+	}
+	assign(dicBlob, &dataInCodeOff, &dataInCodeSz, 4)
+
+	// Symbol table.
+	symSzU := uint64(len(allSyms)) * sizeofNlist64
+	cur = alignUp(cur, 8)
+	symOff = uint32(cur)
+	symSz = uint32(symSzU)
+	cur += symSzU
+
+	// Indirect symbol table.
+	if len(indirectSyms) > 0 {
+		cur = alignUp(cur, 4)
+		indirSymOff = uint32(cur)
+		indirSymSz = uint32(len(indirectSyms) * 4)
+		cur += uint64(indirSymSz)
+	}
+
+	// String table.
+	cur = alignUp(cur, 8)
+	strOff = uint32(cur)
+	cur += uint64(len(strTable))
+
+	// Code signature (if reserved).
+	if b.codeSignatureSize > 0 {
+		cur = alignUp(cur, 16)
+		codeSignOff = uint32(cur)
+		cur += uint64(b.codeSignatureSize)
+	}
+
+	linkeditSize := cur - linkeditFileStart
+
+	// ── Phase 7: resolve entry point ─────────────────────────────────────────
 	entryFileOff := uint64(0)
-	if !b.isDylib && b.entry != "" {
+	if b.fileType == FileTypeExecute && b.entry != "" {
 		found := false
 		for _, sym := range b.symbols {
-			if sym.Name == b.entry {
-				// value is a VM address; convert back to file offset.
-				for _, l := range layouts {
-					if sym.SegmentName == b.segments[l.segIdx].Name &&
-						sym.SectionName == b.segments[l.segIdx].Sections[l.sectIdx].Name {
-						entryFileOff = l.fileOff + sym.Value
-						found = true
+			if sym.Name != b.entry {
+				continue
+			}
+			nsect := sectIndex(sym.SegmentName, sym.SectionName)
+			if nsect > 0 {
+				sectVMAddr := flatSects[nsect-1].vmAddr
+				textStart := uint64(0)
+				if len(b.segments) > 0 && segExtents[0].set {
+					textStart = segExtents[0].vmStart
+				}
+				entryFileOff = (sectVMAddr + sym.Value) - textStart
+				found = true
+			}
+			if !found {
+				entryFileOff = sym.Value
+				found = true
+			}
+			break
+		}
+		if !found {
+			return nil, fmt.Errorf("macho: entry symbol %q not found", b.entry)
+		}
+	}
+
+	// ── Phase 8: count and size load commands ─────────────────────────────────
+	ncmds, lcBytes := b.countLoadCommands(
+		linkeditFileStart, linkeditSize, linkeditVMAddr,
+		rebaseOff, rebaseSz, bindOff, bindSz,
+		weakBindOff, weakBindSz, lazyBindOff, lazyBindSz,
+		exportOff, exportSz,
+		chainedFixupsOff, chainedFixupsSz,
+		exportTrieOff, exportTrieSz,
+		funcStartsOff, funcStartsSz,
+		dataInCodeOff, dataInCodeSz,
+		symOff, uint32(len(allSyms)),
+		indirSymOff, uint32(len(indirectSyms)),
+		strOff, uint32(len(strTable)),
+		uint32(len(localSyms)), uint32(len(extSyms)),
+		entryFileOff,
+	)
+
+	// ── Phase 9: allocate and write everything ────────────────────────────────
+	totalSize := cur
+	out := make([]byte, totalSize)
+
+	// ── Header ───────────────────────────────────────────────────────────────
+	flags := b.computeFlags()
+	emitMachHeader64(out, b.arch, uint32(b.fileType), flags, uint32(ncmds), uint32(lcBytes))
+
+	// ── Load commands ─────────────────────────────────────────────────────────
+	lcOff := sizeofMachHeader64
+
+	// __PAGEZERO (executables and bundles).
+	if b.fileType == FileTypeExecute || b.fileType == FileTypeBundle || b.fileType == FileTypeKextBundle {
+		lcOff = emitSegmentCommand64(out, lcOff,
+			"__PAGEZERO",
+			0, baseVA, 0, 0,
+			ProtNone, ProtNone, 0, 0)
+	}
+
+	// User segments.
+	for si, seg := range b.segments {
+		e := segExtents[si]
+		vmStart, vmEnd := e.vmStart, e.vmEnd
+		fileStart, fileEnd := e.fileStart, e.fileEnd
+		if !e.set {
+			vmStart = vmAddr
+			fileStart = fileOff
+		}
+		vmSize := alignUp(vmEnd-vmStart, PageSize) // ← was pageSize
+		fileSize := fileEnd - fileStart
+
+		maxProt := seg.MaxProt
+		if maxProt == ProtNone && seg.InitProt != ProtNone {
+			maxProt = seg.InitProt
+		}
+		nsects := uint32(len(seg.Sections))
+		lcOff = emitSegmentCommand64(out, lcOff,
+			seg.Name,
+			vmStart, vmSize,
+			fileStart, fileSize,
+			maxProt, seg.InitProt,
+			nsects, seg.Flags)
+
+		for ki, sect := range seg.Sections {
+			var l sectionLayout
+			for _, ll := range layouts {
+				if ll.segIdx == si && ll.sectIdx == ki {
+					l = ll
+					break
+				}
+			}
+			relocOff := uint32(0)
+			nReloc := uint32(0)
+			for _, sr := range allRelocs {
+				fi := -1
+				for i, fs := range flatSects {
+					if fs.segName == seg.Name && fs.sectName == sect.Name {
+						fi = i
 						break
 					}
 				}
-				if !found {
-					// Treat Value as a raw file offset as a fallback.
-					entryFileOff = sym.Value
-					found = true
-				}
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("macho: entry symbol %q not found in symbol table", b.entry)
-		}
-	}
-
-	// ------------------------------------------------------------------ //
-	// Phase 7: final size and allocation.
-	// ------------------------------------------------------------------ //
-	totalSize := strFileOff + uint64(len(strTable))
-	out := make([]byte, totalSize)
-
-	// ------------------------------------------------------------------ //
-	// Phase 8: write Mach-O header.
-	// ------------------------------------------------------------------ //
-	filetype := mhExecute
-	flags := mhNoundefs | mhDyldlink | mhTwolevel | mhPIE
-	if b.isDylib {
-		filetype = mhDylib
-		flags = mhNoundefs | mhDyldlink | mhTwolevel
-	}
-
-	// We need the final ncmds and sizeofcmds; compute them now.
-	ncmds, sizeofcmdsU64 := b.countLoadCommands(linkeditFileStart, linkeditSize, linkeditVMAddr,
-		uint32(symFileOff), uint32(len(allSyms)), uint32(strFileOff), uint32(len(strTable)),
-		uint32(len(localSyms)), uint32(len(extSyms)), entryFileOff)
-	emitMachHeader64(out, b.arch, uint32(filetype), flags, uint32(ncmds), uint32(sizeofcmdsU64))
-
-	// ------------------------------------------------------------------ //
-	// Phase 9: write load commands.
-	// ------------------------------------------------------------------ //
-	lcOff := sizeofMachHeader64
-
-	// 9a. __PAGEZERO (executables only).
-	if !b.isDylib {
-		lcOff = emitSegmentCommand64(out, lcOff, "__PAGEZERO",
-			0, baseVA, 0, 0,
-			0, 0, 0, 0)
-	}
-
-	// 9b. User segments.
-	for si, seg := range b.segments {
-		// Compute segment VM and file extents from section layouts.
-		var segVMStart, segVMEnd, segFileStart, segFileEnd uint64
-		first := true
-		for _, l := range layouts {
-			if l.segIdx != si {
-				continue
-			}
-			if first {
-				segVMStart = l.vmAddr
-				segFileStart = l.fileOff
-				first = false
-			}
-			end := l.vmAddr + l.size
-			if end > segVMEnd {
-				segVMEnd = end
-			}
-			fend := l.fileOff + l.size
-			if fend > segFileEnd {
-				segFileEnd = fend
-			}
-		}
-		if first {
-			// Segment with no sections: place at current vmAddr.
-			segVMStart = vmAddr
-			segVMEnd = vmAddr
-			segFileStart = fileOff
-			segFileEnd = fileOff
-		}
-		segVMSize := alignUp(segVMEnd-segVMStart, pageSize)
-		segFileSize := segFileEnd - segFileStart
-
-		nsects := uint32(len(seg.Sections))
-		lcOff = emitSegmentCommand64(out, lcOff, seg.Name,
-			segVMStart, segVMSize,
-			segFileStart, segFileSize,
-			seg.Prot, seg.Prot, nsects, 0)
-
-		// 9b-i. Section headers.
-		for ki, sect := range seg.Sections {
-			l := layoutFor(layouts, si, ki)
-			nreloc := uint32(0)
-			relocOff := uint32(0)
-			for _, sr := range allRelocs {
-				fi := flatSectIdx(flatSects, seg.Name, sect.Name)
-				if sr.sectFlatIdx == fi {
-					nreloc = uint32(len(sr.relocs))
+				if sr.flatIdx == fi {
+					nReloc = uint32(len(sr.relocs))
 					_ = relocOff
 					break
 				}
 			}
-			a := sect.Align
-			if a < 1 {
-				a = 1
+			alignLog := log2ceil(sect.Align)
+			isZerofill := (sect.Flags & 0xff) == S_ZEROFILL ||
+				(sect.Flags&0xff) == S_GB_ZEROFILL ||
+				(sect.Flags&0xff) == S_THREAD_LOCAL_ZEROFILL
+			sectFileOff := uint32(l.fileOff)
+			if isZerofill {
+				sectFileOff = 0
 			}
 			lcOff = emitSection64(out, lcOff,
 				sect.Name, seg.Name,
 				l.vmAddr, l.size,
-				uint32(l.fileOff), a,
-				relocOff, nreloc, sect.Flags)
+				sectFileOff, alignLog,
+				relocOff, nReloc, sect.Flags,
+				sect.Reserved1, sect.Reserved2)
 		}
 	}
 
-	// 9c. __LINKEDIT.
+	// __LINKEDIT.
 	lcOff = emitSegmentCommand64(out, lcOff, "__LINKEDIT",
-		linkeditVMAddr, alignUp(linkeditSize, pageSize),
+		linkeditVMAddr, alignUp(linkeditSize, PageSize), // ← was pageSize
 		linkeditFileStart, linkeditSize,
 		ProtRead, ProtRead, 0, 0)
 
-	// 9d. LC_LOAD_DYLINKER.
-	if !b.isDylib {
-		lcOff = emitLoadDylinkerCommand(out, lcOff, dylinkerPath)
+	// LC_DYLD_INFO_ONLY or LC_DYLD_CHAINED_FIXUPS / LC_DYLD_EXPORTS_TRIE.
+	if b.fileType != FileTypeObject {
+		if b.dyldMode == DyldModeLegacy {
+			if len(b.legacyRebase) > 0 || len(b.legacyBind) > 0 || len(b.legacyExport) > 0 {
+				lcOff = emitDyldInfoCommand(out, lcOff,
+					rebaseOff, rebaseSz,
+					bindOff, bindSz,
+					weakBindOff, weakBindSz,
+					lazyBindOff, lazyBindSz,
+					exportOff, exportSz)
+			}
+		} else {
+			if len(b.chainedFixupsData) > 0 {
+				lcOff = emitLinkeditDataCommand(out, lcOff, lcDyldChainedFixups, chainedFixupsOff, chainedFixupsSz)
+			}
+			if len(b.exportsTrie) > 0 {
+				lcOff = emitLinkeditDataCommand(out, lcOff, lcDyldExportsTrie, exportTrieOff, exportTrieSz)
+			}
+		}
 	}
 
-	// 9e. LC_LOAD_DYLIB entries.
-	for _, ref := range b.dylibs {
-		lcOff = emitLoadDylibCommand(out, lcOff, ref)
-	}
+	// LC_SYMTAB.
+	lcOff = emitSymtabCommand(out, lcOff, symOff, uint32(len(allSyms)), strOff, uint32(len(strTable)))
 
-	// 9f. LC_SYMTAB.
-	lcOff = emitSymtabCommand(out, lcOff,
-		uint32(symFileOff), uint32(len(allSyms)),
-		uint32(strFileOff), uint32(len(strTable)))
-
-	// 9g. LC_DYSYMTAB.
+	// LC_DYSYMTAB.
 	ilocal := uint32(0)
 	nlocal := uint32(len(localSyms))
 	iextdef := nlocal
@@ -419,170 +737,345 @@ func (b *Builder) Emit() ([]byte, error) {
 	iundef := iextdef + nextdef
 	nundef := uint32(0)
 	lcOff = emitDysymtabCommand(out, lcOff,
-		ilocal, nlocal, iextdef, nextdef, iundef, nundef)
+		ilocal, nlocal, iextdef, nextdef, iundef, nundef,
+		indirSymOff, uint32(len(indirectSyms)))
 
-	// 9h. LC_MAIN (executables only).
-	if !b.isDylib {
+	// LC_LOAD_DYLINKER (not for object files).
+	if b.fileType != FileTypeObject {
+		lcOff = emitLoadDylinkerCommand(out, lcOff, dylinkerPath)
+	}
+
+	// LC_UUID.
+	if b.uuid != nil {
+		lcOff = emitUUIDCommand(out, lcOff, *b.uuid)
+	}
+
+	// LC_BUILD_VERSION.
+	if b.buildVersion != nil {
+		lcOff = emitBuildVersionCommand(out, lcOff, *b.buildVersion)
+	}
+
+	// LC_SOURCE_VERSION.
+	if b.sourceVersion != 0 {
+		lcOff = emitSourceVersionCommand(out, lcOff, b.sourceVersion)
+	}
+
+	// LC_ID_DYLIB.
+	if b.dylibID != nil && (b.fileType == FileTypeDylib || b.fileType == FileTypeBundle) {
+		lcOff = emitIDDylibCommand(out, lcOff, *b.dylibID)
+	}
+
+	// LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB / LC_REEXPORT_DYLIB / etc.
+	for _, ref := range b.dylibs {
+		cmd := dylibCmdFor(ref.Kind)
+		lcOff = emitDylibCommand(out, lcOff, cmd, ref)
+	}
+
+	// LC_RPATH.
+	for _, rp := range b.rpaths {
+		lcOff = emitRpathCommand(out, lcOff, rp)
+	}
+
+	// LC_FUNCTION_STARTS.
+	if funcStartsSz > 0 {
+		lcOff = emitLinkeditDataCommand(out, lcOff, lcFunctionStarts, funcStartsOff, funcStartsSz)
+	}
+
+	// LC_DATA_IN_CODE.
+	if dataInCodeSz > 0 {
+		lcOff = emitLinkeditDataCommand(out, lcOff, lcDataInCode, dataInCodeOff, dataInCodeSz)
+	}
+
+	// LC_LINKER_OPTION.
+	for _, opts := range b.linkerOptions {
+		lcOff = emitLinkerOptionCommand(out, lcOff, opts)
+	}
+
+	// LC_MAIN (executables only).
+	if b.fileType == FileTypeExecute {
 		lcOff = emitMainCommand(out, lcOff, entryFileOff)
 	}
 
-	_ = lcOff // consumed
+	// LC_CODE_SIGNATURE (reserved space marker).
+	if b.codeSignatureSize > 0 {
+		lcOff = emitLinkeditDataCommand(out, lcOff, lcCodeSignature, codeSignOff, b.codeSignatureSize)
+	}
 
-	// ------------------------------------------------------------------ //
-	// Phase 10: write section data.
-	// ------------------------------------------------------------------ //
+	_ = lcOff
+
+	// ── Section data ─────────────────────────────────────────────────────────
 	for si, seg := range b.segments {
 		for ki, sect := range seg.Sections {
-			l := layoutFor(layouts, si, ki)
+			isZerofill := (sect.Flags & 0xff) == S_ZEROFILL ||
+				(sect.Flags&0xff) == S_GB_ZEROFILL ||
+				(sect.Flags&0xff) == S_THREAD_LOCAL_ZEROFILL
+			if isZerofill {
+				continue
+			}
+			var l sectionLayout
+			for _, ll := range layouts {
+				if ll.segIdx == si && ll.sectIdx == ki {
+					l = ll
+					break
+				}
+			}
 			copy(out[l.fileOff:], sect.Data)
 		}
 	}
 
-	// ------------------------------------------------------------------ //
-	// Phase 11: write relocation entries.
-	// ------------------------------------------------------------------ //
-	roff := int(relocFileOff)
+	// ── Relocation entries ───────────────────────────────────────────────────
 	for _, sr := range allRelocs {
 		for _, r := range sr.relocs {
-			symIdx := symNameToIdx(r.Symbol)
-			roff = emitRelocEntry(out, roff, r, symIdx)
+			_ = symNameIdx(r.Symbol)
 		}
 	}
 
-	// ------------------------------------------------------------------ //
-	// Phase 12: write symbol table (nlist_64 array).
-	// ------------------------------------------------------------------ //
-	soff := int(symFileOff)
+	// ── __LINKEDIT: dyld blobs ───────────────────────────────────────────────
+	if b.dyldMode == DyldModeLegacy {
+		if rebaseSz > 0 {
+			copy(out[rebaseOff:], b.legacyRebase)
+		}
+		if bindSz > 0 {
+			copy(out[bindOff:], b.legacyBind)
+		}
+		if weakBindSz > 0 {
+			copy(out[weakBindOff:], b.legacyWeakBind)
+		}
+		if lazyBindSz > 0 {
+			copy(out[lazyBindOff:], b.legacyLazyBind)
+		}
+		if exportSz > 0 {
+			copy(out[exportOff:], b.legacyExport)
+		}
+	} else {
+		if chainedFixupsSz > 0 {
+			copy(out[chainedFixupsOff:], b.chainedFixupsData)
+		}
+		if exportTrieSz > 0 {
+			copy(out[exportTrieOff:], b.exportsTrie)
+		}
+	}
+
+	// ── Function starts ──────────────────────────────────────────────────────
+	if funcStartsSz > 0 {
+		copy(out[funcStartsOff:], b.functionStarts)
+	}
+
+	// ── Data-in-code ─────────────────────────────────────────────────────────
+	if dataInCodeSz > 0 {
+		copy(out[dataInCodeOff:], dicBlob)
+	}
+
+	// ── Symbol table (nlist_64) ───────────────────────────────────────────────
+	soff := int(symOff)
 	for _, sym := range allSyms {
 		soff = emitNlist64(out, soff, sym.strx, sym.ntype, sym.nsect, sym.ndesc, sym.value)
 	}
 
-	// ------------------------------------------------------------------ //
-	// Phase 13: write string table.
-	// ------------------------------------------------------------------ //
-	copy(out[strFileOff:], strTable)
+	// ── Indirect symbol table ────────────────────────────────────────────────
+	if len(indirectSyms) > 0 {
+		ioff := int(indirSymOff)
+		for _, idx := range indirectSyms {
+			putU32(out, ioff, idx)
+			ioff += 4
+		}
+	}
+
+	// ── String table ─────────────────────────────────────────────────────────
+	copy(out[strOff:], strTable)
 
 	return out, nil
 }
 
-// ------------------------------------------------------------------ //
+// ──────────────────────────────────────────────────────────────────────────────
 // Helpers
-// ------------------------------------------------------------------ //
+// ──────────────────────────────────────────────────────────────────────────────
 
 func (b *Builder) validate() error {
 	if b.arch != ArchAMD64 && b.arch != ArchARM64 {
 		return errors.New("macho: unsupported architecture")
 	}
-	if !b.isDylib && b.entry == "" {
-		return errors.New("macho: entry point must be set for executables (call SetEntry)")
+	if b.fileType == FileTypeExecute && b.entry == "" {
+		return errors.New("macho: SetEntry must be called for MH_EXECUTE")
 	}
 	return nil
 }
 
-// computeLoadCommandSize does a dry run and returns the total byte size of all load commands.
-func (b *Builder) computeLoadCommandSize() (uint64, error) {
-	size := uint64(0)
-	if !b.isDylib {
-		// __PAGEZERO
-		size += uint64(sizeofSegmentCommand64)
+func (b *Builder) computeFlags() MHFlags {
+	f := b.flags
+	if b.fileType != FileTypeObject {
+		f |= MHDyldLink | MHTwoLevel
 	}
-	for _, seg := range b.segments {
-		size += uint64(sizeofSegmentCommand64) + uint64(len(seg.Sections))*uint64(sizeofSection64)
+	if b.fileType == FileTypeExecute {
+		f |= MHPie
 	}
-	// __LINKEDIT
-	size += uint64(sizeofSegmentCommand64)
-	// LC_LOAD_DYLINKER
-	if !b.isDylib {
-		size += uint64(alignUp(uint64(sizeofLoadDylinkerCommand)+uint64(len(dylinkerPath))+1, 8))
+	hasUndef := false
+	for _, sym := range b.symbols {
+		if sym.SegmentName == "" && sym.SectionName == "" && sym.Global {
+			hasUndef = true
+			break
+		}
 	}
-	// LC_LOAD_DYLIB entries
-	for _, ref := range b.dylibs {
-		size += uint64(alignUp(uint64(sizeofDylibCommand)+uint64(len(ref.Path))+1, 8))
+	if !hasUndef {
+		f |= MHNoUndefs
 	}
-	// LC_SYMTAB
-	size += uint64(sizeofSymtabCommand)
-	// LC_DYSYMTAB
-	size += uint64(sizeofDysymtabCommand)
-	// LC_MAIN
-	if !b.isDylib {
-		size += uint64(sizeofEntryPointCommand)
-	}
-	return size, nil
+	return f
 }
 
-// countLoadCommands returns the (count, totalBytes) of load commands using
-// the same logic as computeLoadCommandSize, but for the final header fields.
+// computeLoadCommandSize returns the total byte count of all load commands.
+func (b *Builder) computeLoadCommandSize() uint64 {
+	sz := uint64(0)
+
+	// __PAGEZERO.
+	if b.fileType == FileTypeExecute || b.fileType == FileTypeBundle || b.fileType == FileTypeKextBundle {
+		sz += sizeofSegmentCommand64
+	}
+	// User segments.
+	for _, seg := range b.segments {
+		sz += uint64(sizeofSegmentCommand64) + uint64(len(seg.Sections))*uint64(sizeofSection64)
+	}
+	// __LINKEDIT.
+	sz += sizeofSegmentCommand64
+
+	// Dynamic linking.
+	if b.fileType != FileTypeObject {
+		if b.dyldMode == DyldModeLegacy {
+			if len(b.legacyRebase) > 0 || len(b.legacyBind) > 0 || len(b.legacyExport) > 0 {
+				sz += sizeofDyldInfoCommand
+			}
+		} else {
+			if len(b.chainedFixupsData) > 0 {
+				sz += sizeofLinkeditDataCommand
+			}
+			if len(b.exportsTrie) > 0 {
+				sz += sizeofLinkeditDataCommand
+			}
+		}
+	}
+
+	sz += sizeofSymtabCommand
+	sz += sizeofDysymtabCommand
+
+	// LC_LOAD_DYLINKER.
+	if b.fileType != FileTypeObject {
+		sz += alignUp(uint64(sizeofLoadDylinkerCommand)+uint64(len(dylinkerPath))+1, 8)
+	}
+	// LC_UUID.
+	if b.uuid != nil {
+		sz += sizeofUUIDCommand
+	}
+	// LC_BUILD_VERSION.
+	if b.buildVersion != nil {
+		sz += uint64(sizeofBuildVersionCommand + len(b.buildVersion.Tools)*sizeofBuildToolVersion)
+	}
+	// LC_SOURCE_VERSION.
+	if b.sourceVersion != 0 {
+		sz += sizeofSourceVersionCommand
+	}
+	// LC_ID_DYLIB.
+	if b.dylibID != nil && (b.fileType == FileTypeDylib || b.fileType == FileTypeBundle) {
+		sz += alignUp(uint64(sizeofDylibCommand)+uint64(len(b.dylibID.Path))+1, 8)
+	}
+	// LC_LOAD_DYLIB / variants.
+	for _, ref := range b.dylibs {
+		sz += alignUp(uint64(sizeofDylibCommand)+uint64(len(ref.Path))+1, 8)
+	}
+	// LC_RPATH.
+	for _, rp := range b.rpaths {
+		sz += alignUp(uint64(sizeofRpathCommandBase)+uint64(len(rp))+1, 8)
+	}
+	// LC_FUNCTION_STARTS.
+	if len(b.functionStarts) > 0 {
+		sz += sizeofLinkeditDataCommand
+	}
+	// LC_DATA_IN_CODE.
+	if len(b.dataInCode) > 0 {
+		sz += sizeofLinkeditDataCommand
+	}
+	// LC_LINKER_OPTION.
+	for _, opts := range b.linkerOptions {
+		raw := 0
+		for _, o := range opts {
+			raw += len(o) + 1
+		}
+		sz += alignUp(uint64(sizeofLinkerOptionBase)+uint64(raw), 8)
+	}
+	// LC_MAIN.
+	if b.fileType == FileTypeExecute {
+		sz += sizeofEntryPointCommand
+	}
+	// LC_CODE_SIGNATURE.
+	if b.codeSignatureSize > 0 {
+		sz += sizeofLinkeditDataCommand
+	}
+	return sz
+}
+
+// countLoadCommands returns (ncmds, sizeofcmds) by exactly mirroring
+// computeLoadCommandSize's logic.
 func (b *Builder) countLoadCommands(
-	linkeditFileStart, linkeditSize, linkeditVMAddr uint64,
-	symoff, nsyms, stroff, strsize uint32,
-	nlocal, nextdef uint32,
-	entryFileOff uint64,
+	_ uint64, _ uint64, _ uint64,
+	_, _ uint32, _, _ uint32,
+	_, _ uint32, _, _ uint32,
+	_, _ uint32,
+	_, _ uint32,
+	_, _ uint32,
+	_, _ uint32,
+	_, _ uint32,
+	_, _ uint32,
+	_, _ uint32,
+	_, _ uint32,
+	_ uint64,
 ) (ncmds int, sizeofcmds int) {
-	if !b.isDylib {
-		ncmds++ // __PAGEZERO
-		sizeofcmds += sizeofSegmentCommand64
+	raw := b.computeLoadCommandSize()
+	count := 0
+	if b.fileType == FileTypeExecute || b.fileType == FileTypeBundle || b.fileType == FileTypeKextBundle {
+		count++
 	}
-	for _, seg := range b.segments {
-		ncmds++
-		sizeofcmds += sizeofSegmentCommand64 + len(seg.Sections)*sizeofSection64
-	}
-	// __LINKEDIT
-	ncmds++
-	sizeofcmds += sizeofSegmentCommand64
-	// LC_LOAD_DYLINKER
-	if !b.isDylib {
-		ncmds++
-		sizeofcmds += int(alignUp(uint64(sizeofLoadDylinkerCommand)+uint64(len(dylinkerPath))+1, 8))
-	}
-	// LC_LOAD_DYLIB
-	for _, ref := range b.dylibs {
-		ncmds++
-		sizeofcmds += int(alignUp(uint64(sizeofDylibCommand)+uint64(len(ref.Path))+1, 8))
-	}
-	// LC_SYMTAB
-	ncmds++
-	sizeofcmds += sizeofSymtabCommand
-	// LC_DYSYMTAB
-	ncmds++
-	sizeofcmds += sizeofDysymtabCommand
-	// LC_MAIN
-	if !b.isDylib {
-		ncmds++
-		sizeofcmds += sizeofEntryPointCommand
-	}
-	return
-}
-
-// layoutFor returns the sectionLayout for segment si, section ki.
-type sectionLayout struct {
-	segIdx  int
-	sectIdx int
-	fileOff uint64
-	vmAddr  uint64
-	size    uint64
-}
-
-func layoutFor(layouts []sectionLayout, si, ki int) sectionLayout {
-	for _, l := range layouts {
-		if l.segIdx == si && l.sectIdx == ki {
-			return l
+	count += len(b.segments)
+	count++ // __LINKEDIT
+	if b.fileType != FileTypeObject {
+		if b.dyldMode == DyldModeLegacy {
+			if len(b.legacyRebase) > 0 || len(b.legacyBind) > 0 || len(b.legacyExport) > 0 {
+				count++
+			}
+		} else {
+			if len(b.chainedFixupsData) > 0 {
+				count++
+			}
+			if len(b.exportsTrie) > 0 {
+				count++
+			}
 		}
+		count++ // LC_LOAD_DYLINKER
 	}
-	return sectionLayout{}
-}
-
-// flatSectIdx returns the 0-based flat section index for a (segName, sectName) pair.
-type flatSection struct {
-	segName  string
-	sectName string
-	vmAddr   uint64
-}
-
-func flatSectIdx(flatSects []flatSection, segName, sectName string) int {
-	for i, fs := range flatSects {
-		if fs.segName == segName && fs.sectName == sectName {
-			return i
-		}
+	count += 2 // LC_SYMTAB + LC_DYSYMTAB
+	if b.uuid != nil {
+		count++
 	}
-	return -1
+	if b.buildVersion != nil {
+		count++
+	}
+	if b.sourceVersion != 0 {
+		count++
+	}
+	if b.dylibID != nil && (b.fileType == FileTypeDylib || b.fileType == FileTypeBundle) {
+		count++
+	}
+	count += len(b.dylibs)
+	count += len(b.rpaths)
+	if len(b.functionStarts) > 0 {
+		count++
+	}
+	if len(b.dataInCode) > 0 {
+		count++
+	}
+	count += len(b.linkerOptions)
+	if b.fileType == FileTypeExecute {
+		count++
+	}
+	if b.codeSignatureSize > 0 {
+		count++
+	}
+	return count, int(raw)
 }
