@@ -8,7 +8,6 @@ import (
 	"github.com/vertex-language/compiler/object"
 	"github.com/vertex-language/compiler/wasm"
 
-	// Import the architecture-specific memory allocators directly
 	amd64mem "github.com/vertex-language/compiler/cpu/amd64/memory"
 	arm64mem "github.com/vertex-language/compiler/cpu/arm64/memory"
 )
@@ -23,7 +22,9 @@ func New() *Driver {
 	return &Driver{targets: make(map[string]Target)}
 }
 
-// Register adds a code generation target to the driver.
+// Register adds a backend Target to the driver. The target is keyed by the
+// string returned from its ID() method. Registering a second target with the
+// same ID replaces the first.
 func (d *Driver) Register(t Target) {
 	d.targets[t.ID()] = t
 }
@@ -37,12 +38,11 @@ func (d *Driver) Compile(m *wasm.Module, arch object.Arch, platform object.Platf
 
 	defaultArch := archID(arch)
 
-	routes, err := Analyze(ctx, defaultArch)
+	routes, err := Analyze(ctx, defaultArch, arch, platform)
 	if err != nil {
 		return nil, err
 	}
 
-	// Route memory emission directly to the architecture-specific packages
 	switch arch {
 	case object.AMD64:
 		err = amd64mem.Emit(ctx)
@@ -70,6 +70,49 @@ func (d *Driver) Compile(m *wasm.Module, arch object.Arch, platform object.Platf
 	}
 
 	return ctx.Obj, nil
+}
+
+// CompileFull mirrors Compile but additionally returns the populated
+// BuildContext so callers (e.g. linker.LinkResult) can inspect resolved
+// system libraries and pointer masks without re-running analysis.
+func (d *Driver) CompileFull(m *wasm.Module, arch object.Arch, platform object.Platform) (object.Object, *context.BuildContext, error) {
+	obj := object.New(arch, platform)
+	ctx := context.NewBuildContext(m, obj)
+
+	defaultArch := archID(arch)
+
+	routes, err := Analyze(ctx, defaultArch, arch, platform)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch arch {
+	case object.AMD64:
+		err = amd64mem.Emit(ctx)
+	case object.ARM64:
+		err = arm64mem.Emit(ctx)
+	default:
+		return nil, nil, fmt.Errorf("driver: memory allocator not yet ported to %s", arch)
+	}
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("driver: failed to emit memory stubs: %w", err)
+	}
+
+	for targetID, funcs := range routes {
+		if len(funcs) == 0 {
+			continue
+		}
+		t, ok := d.targets[targetID]
+		if !ok {
+			return nil, nil, fmt.Errorf("driver: unsupported target backend %q", targetID)
+		}
+		if err := t.Emit(ctx, funcs); err != nil {
+			return nil, nil, fmt.Errorf("driver: %s compilation failed: %w", targetID, err)
+		}
+	}
+
+	return ctx.Obj, ctx, nil
 }
 
 // archID maps an object.Arch to the string routing key used in RoutingTable.

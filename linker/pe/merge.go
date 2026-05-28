@@ -1,6 +1,9 @@
 package pe
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+)
 
 const (
 	fileAlign    = uint32(0x200)
@@ -23,22 +26,19 @@ func MergeSections(objs []*ObjectFile) (*Layout, error) {
 }
 
 func mergeSections(objs []*ObjectFile) (*Layout, error) {
-	// Determine which COMDAT sections survive: key = "objPath/secIndex".
-	// We use the global symbol table's decisions (already made during ingest).
-	// Here we just follow a simple rule: first definition wins for ANY/etc.
 	type comdatKey struct {
 		name string
 	}
 	comdatWinner := make(map[comdatKey]*RawSection)
 
 	layout := &Layout{}
-	order := []string{} // ordered unique section names
+	order := []string{}
 	byName := make(map[string]*MergedSection)
 
 	for _, obj := range objs {
 		for _, sec := range obj.Sections {
 			if sec.Name == ".drectve" || sec.Name == ".llvm_addrsig" {
-				continue // meta-sections, not emitted
+				continue
 			}
 			if sec.Chars&0x00000200 != 0 { // IMAGE_SCN_LNK_INFO
 				continue
@@ -54,11 +54,9 @@ func mergeSections(objs []*ObjectFile) (*Layout, error) {
 					if err := applyComdatSelection(winner, sec); err != nil {
 						return nil, err
 					}
-					// If selection says discard incoming, skip it.
 					if winner != sec {
-						continue // this contribution is discarded
+						continue
 					}
-					// Otherwise (e.g. LARGEST picked incoming), replace winner.
 					comdatWinner[k] = sec
 				} else {
 					comdatWinner[k] = sec
@@ -69,23 +67,19 @@ func mergeSections(objs []*ObjectFile) (*Layout, error) {
 			if !exists {
 				ms = &MergedSection{
 					Name:  sec.Name,
-					Chars: sec.Chars &^ (0x00F00000), // strip alignment field from output
+					Chars: sec.Chars &^ (0x00F00000),
 				}
 				byName[sec.Name] = ms
 				order = append(order, sec.Name)
 				layout.Sections = append(layout.Sections, ms)
 			}
-			// Update Chars (take union of flags except alignment).
 			ms.Chars |= sec.Chars &^ (0x00F00000)
 
-			// Compute alignment for this section (from Chars alignment field).
 			alignment := sectionAlignFromChars(sec.Chars)
 
-			// Append piece.
 			isBSS := sec.Chars&0x00000080 != 0
 			var off uint32
 			if isBSS {
-				// BSS: only add to virtual size.
 				off = align32(ms.VirtualSize, alignment)
 				sz := sec.VirtualSize
 				if sz == 0 {
@@ -93,9 +87,7 @@ func mergeSections(objs []*ObjectFile) (*Layout, error) {
 				}
 				ms.VirtualSize = off + sz
 			} else {
-				// Initialized data or code.
 				if len(ms.Data) > 0 || ms.VirtualSize > 0 {
-					// Pad to alignment.
 					padded := align32(uint32(len(ms.Data)), alignment)
 					for uint32(len(ms.Data)) < padded {
 						ms.Data = append(ms.Data, 0)
@@ -120,16 +112,14 @@ func mergeSections(objs []*ObjectFile) (*Layout, error) {
 			})
 		}
 	}
+	_ = order
 
-	// Sort sections into canonical output order.
 	sortSections(layout.Sections)
-
 	return layout, nil
 }
 
 // applyComdatSelection decides whether to keep the existing winner or switch
-// to incoming. Returns an error for NODUPLICATES conflicts.
-// Mutates winner in-place for LARGEST (swaps to incoming).
+// to incoming.
 func applyComdatSelection(winner, incoming *RawSection) error {
 	sel := winner.ComdatSel
 	if sel == 0 {
@@ -139,7 +129,7 @@ func applyComdatSelection(winner, incoming *RawSection) error {
 	case 1: // NODUPLICATES
 		return fmt.Errorf("duplicate COMDAT section %q (SELECT_NODUPLICATES)", winner.Name)
 	case 2: // ANY
-		return nil // keep existing
+		return nil
 	case 3: // SAME_SIZE
 		if len(winner.Data) != len(incoming.Data) {
 			return fmt.Errorf("COMDAT size mismatch for %q", winner.Name)
@@ -151,10 +141,10 @@ func applyComdatSelection(winner, incoming *RawSection) error {
 		}
 		return nil
 	case 5: // ASSOCIATIVE
-		return nil // leader governs; handled separately
+		return nil
 	case 6: // LARGEST
 		if len(incoming.Data) > len(winner.Data) {
-			*winner = *incoming // take incoming
+			*winner = *incoming
 		}
 		return nil
 	default:
@@ -171,8 +161,7 @@ func sectionAlignFromChars(chars uint32) uint32 {
 	return 1 << (alignField - 1)
 }
 
-// sortSections places sections in the canonical PE output order:
-// .text, .rdata, .data, .bss, then alphabetical for the rest.
+// sortSections places sections in the canonical PE output order.
 func sortSections(secs []*MergedSection) {
 	priority := map[string]int{
 		".text":  0,
@@ -205,7 +194,6 @@ func sortSections(secs []*MergedSection) {
 
 // AssignLayout computes virtual addresses for all merged sections and the
 // synthetic sections (.idata, .edata, .reloc) that bin/pe will add.
-// It stores VAddr in each MergedSection and returns the SyntheticLayout.
 func AssignLayout(layout *Layout, imports []*CollectedImport, exports []ExportRecord,
 	dynamicBase bool, dllName string, hasLoadCfg bool, hasDebugEntries bool) SyntheticLayout {
 	return assignLayout(layout, imports, exports, dynamicBase, dllName, hasLoadCfg, hasDebugEntries)
@@ -213,19 +201,17 @@ func AssignLayout(layout *Layout, imports []*CollectedImport, exports []ExportRe
 
 // SyntheticLayout holds the computed VAs for bin/pe-synthesized sections.
 type SyntheticLayout struct {
-	IdataVA    uint32 // .idata section VA (0 if no imports)
-	EdataVA    uint32 // .edata section VA (0 if no exports)
-	RelocVA    uint32 // .reloc section VA (0 if not dynamic base)
-	LcfgVA     uint32 // .rdata$lc section VA (0 if no load config)
-	DebugVA    uint32 // .debug section VA (0 if no explicit debug entries)
-	// IAT slot RVAs for each import symbol: "DLL\x00sym" → RVA.
+	IdataVA    uint32
+	EdataVA    uint32
+	RelocVA    uint32
+	LcfgVA     uint32
+	DebugVA    uint32
 	IATSlotRVA map[string]uint32
 }
 
 func assignLayout(layout *Layout, imports []*CollectedImport, exports []ExportRecord,
 	dynamicBase bool, dllName string, hasLoadCfg bool, hasDebugEntries bool) SyntheticLayout {
 
-	// Count synthetic sections bin/pe will add.
 	numSynthetic := 0
 	hasImports := len(imports) > 0
 	hasExports := len(exports) > 0
@@ -249,7 +235,6 @@ func assignLayout(layout *Layout, imports []*CollectedImport, exports []ExportRe
 	sizeOfHeaders := align32(uint32(fixedHdrBytes+numSections*sectHdrBytes), fileAlign)
 	va := align32(sizeOfHeaders, sectAlign)
 
-	// Assign VAs to user sections.
 	for _, sec := range layout.Sections {
 		sec.VAddr = va
 		vsz := sec.VirtualSize
@@ -261,35 +246,29 @@ func assignLayout(layout *Layout, imports []*CollectedImport, exports []ExportRe
 
 	sl := SyntheticLayout{IATSlotRVA: make(map[string]uint32)}
 
-	// .idata VA and IAT slot computation.
 	if hasImports {
 		sl.IdataVA = va
-		// Mirror bin/pe's buildIDATA layout to compute IAT slot RVAs.
 		computeIATSlots(&sl, imports, va)
 		idataSz := measureIDATA(imports)
 		va = align32(va+idataSz, sectAlign)
 	}
 
-	// .edata VA.
 	if hasExports {
 		sl.EdataVA = va
 		edataSz := measureEDATA(exports, dllName)
 		va = align32(va+edataSz, sectAlign)
 	}
 
-	// .rdata$lc VA.
 	if hasLoadCfg {
 		sl.LcfgVA = va
-		va = align32(va+148, sectAlign) // loadConfigSize = 148
+		va = align32(va+148, sectAlign)
 	}
 
-	// .debug VA.
 	if hasDebugEntries {
 		sl.DebugVA = va
-		va = align32(va+sectAlign, sectAlign) // placeholder; will be exact after entries known
+		va = align32(va+sectAlign, sectAlign)
 	}
 
-	// .reloc VA.
 	if dynamicBase {
 		sl.RelocVA = va
 	}
@@ -298,19 +277,15 @@ func assignLayout(layout *Layout, imports []*CollectedImport, exports []ExportRe
 }
 
 // measureIDATA returns the byte size of the .idata section for the given imports.
-// Mirrors bin/pe's buildIDATA layout.
 func measureIDATA(imports []*CollectedImport) uint32 {
 	N := len(imports)
-	cur := uint32((N + 1) * 20) // descriptor table
-	// ILT arrays.
+	cur := uint32((N + 1) * 20)
 	for _, imp := range imports {
 		cur += uint32((len(imp.Symbols) + 1) * 8)
 	}
-	// IAT arrays.
 	for _, imp := range imports {
 		cur += uint32((len(imp.Symbols) + 1) * 8)
 	}
-	// Hint/Name entries.
 	for _, imp := range imports {
 		for _, sym := range imp.Symbols {
 			if sym.Name == "" {
@@ -323,7 +298,6 @@ func measureIDATA(imports []*CollectedImport) uint32 {
 			cur += sz
 		}
 	}
-	// DLL name strings.
 	for _, imp := range imports {
 		cur += uint32(len(imp.DLL)) + 1
 	}
@@ -333,22 +307,19 @@ func measureIDATA(imports []*CollectedImport) uint32 {
 // computeIATSlots fills sl.IATSlotRVA for every import symbol.
 func computeIATSlots(sl *SyntheticLayout, imports []*CollectedImport, baseRVA uint32) {
 	N := len(imports)
-	descEnd := uint32((N + 1) * 20)
-	// ILT arrays.
-	cur := descEnd
+	cur := uint32((N + 1) * 20)
+	// Skip past ILT arrays.
 	iltOffsets := make([]uint32, N)
 	for i, imp := range imports {
 		iltOffsets[i] = cur
 		cur += uint32((len(imp.Symbols) + 1) * 8)
 	}
-	// IAT arrays start here.
-	iatBase := cur
+	// IAT arrays.
 	iatOffsets := make([]uint32, N)
 	for i, imp := range imports {
 		iatOffsets[i] = cur
 		cur += uint32((len(imp.Symbols) + 1) * 8)
 	}
-	_ = iatBase
 	_ = iltOffsets
 
 	for i, imp := range imports {

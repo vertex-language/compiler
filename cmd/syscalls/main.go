@@ -1,90 +1,63 @@
 // cmd/sample_syscall/main.go
 //
+// Demonstrates the unified linker.Build API.
+// The frontend declares function signatures via the @-suffix ABI syntax and
+// calls linker.Build — system library resolution, DT_NEEDED wiring, and
+// interpreter path selection are all handled automatically.
+//
 // Build and run:
 //
-//	go run main.go -o sample_syscall
+//	go run main.go
 //	./sample_syscall
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 
-	"github.com/vertex-language/compiler"
-	"github.com/vertex-language/compiler/linker/elf"
+	"github.com/vertex-language/compiler/linker"
 	"github.com/vertex-language/compiler/wasm"
 )
 
 func main() {
-	outPath := flag.String("o", "sample_syscall", "output binary path")
-	flag.Parse()
-
-	m := buildModule()
-
-	// 1. Compile the WASM module into a native object representation.
-	obj, err := compiler.CompileWith(m, compiler.Options{})
+	bin, err := linker.Build(buildModule(), linker.Options{})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "compile: %v\n", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	// 2. Emit the native object bytes (ELF64 ET_REL format).
-	objBytes, err := obj.Emit()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "emit object: %v\n", err)
+	const outPath = "sample_syscall"
+	if err := os.WriteFile(outPath, bin, 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	// 3. Parse the emitted object bytes for the linker.
-	parsedObj, err := elf.ParseObject(objBytes)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse object: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("compiled:  %d sections  %d symbols  %d relocations\n",
-		len(parsedObj.Sections), len(parsedObj.Symbols), len(parsedObj.Relocs))
-
-	// 4. Setup the ELF Linker for AMD64.
-	lnk := elf.NewLinker(elf.EM_X86_64) // 0x3E
-	
-	// CRITICAL FIX: Use the synthesized _start wrapper as the entry point
-	// instead of main, so the process terminates safely via sys_exit.
-	lnk.SetEntry("_start")
-	
-	lnk.AddObject(parsedObj)
-
-	// 5. Run the linker phases (resolution, merging, layout, patching).
-	result, err := lnk.Link()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "link: %v\n", err)
-		os.Exit(1)
-	}
-
-	// 6. Build and emit the final executable binary.
-	bin, err := result.Builder().Emit()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "build elf: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := os.WriteFile(*outPath, bin, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "write: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("wrote:     %s (%d bytes)\n", *outPath, len(bin))
+	fmt.Printf("wrote %s (%d bytes)\n", outPath, len(bin))
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Module construction
+//
+// The frontend's only job is:
+//   1. Declare the right wasm types.
+//   2. Import functions with the correct @-suffix ABI signature.
+//   3. Write the function body.
+//
+// Everything else — which .so to link, what DT_NEEDED to emit, whether to add
+// PT_INTERP, how to translate linear-memory pointers — is inferred from the
+// import module path and the @-suffix and handled by linker.Build.
+// ────────────────────────────────────────────────────────────────────────────
+
 const (
-	fnWrite = uint32(0) // imported
-	fnMain  = uint32(1) // locally defined
+	// Function indices in the order imports are declared, then locals follow.
+	fnWrite = uint32(0) // import: linux/kernel/syscalls · write
+	fnMain  = uint32(1) // local:  main
 )
 
 const (
-	msg1    = "Hello from linux/kernel/syscalls!\n"
-	msg2    = "No libc. No interpreter. Just the kernel.\n"
+	msg1 = "Hello from linux/kernel/syscalls!\n"
+	msg2 = "No libc. No interpreter. Just the kernel.\n"
+
 	msg1Off = int32(0)
 	msg2Off = int32(len(msg1))
 )
@@ -92,9 +65,15 @@ const (
 func buildModule() *wasm.Module {
 	m := wasm.NewModule()
 
+	// ── Types ──────────────────────────────────────────────────────────────
+
 	// write(fd i32, buf ptr, count i32) → i32
-	// The "@i32.ptr.i32" suffix tells the compiler that param 1 is a
-	// linear-memory pointer and needs R15 translation before the syscall.
+	//
+	// The "ptr" token in "@i32.ptr.i32" tells the compiler that parameter 1
+	// is a linear-memory offset that needs native address translation
+	// (+ R15) before the syscall is emitted. The frontend does not need to
+	// know the register layout or the syscall number — it only declares the
+	// logical type of each parameter.
 	tWrite := m.Types.AddFuncType(wasm.FuncType{
 		Params:  []wasm.ValType{wasm.I32, wasm.I32, wasm.I32},
 		Results: []wasm.ValType{wasm.I32},
@@ -104,13 +83,20 @@ func buildModule() *wasm.Module {
 		Results: []wasm.ValType{wasm.I32},
 	})
 
-	// Note: Updated the namespace to use '/' instead of ':' per abi.go routing rules.
+	// ── Imports ────────────────────────────────────────────────────────────
+
+	// "linux/kernel/syscalls" → inline syscall, no PLT, no libc.
+	// linker.Build sees no system library here, so no DT_NEEDED is emitted
+	// and no PT_INTERP is added. The binary has zero dynamic dependencies.
 	m.Imports.AddFunc("linux/kernel/syscalls", "write@i32.ptr.i32", tWrite)
+
+	// ── Locals, memory, exports ────────────────────────────────────────────
 
 	m.Functions.Add(tMain)
 	m.Memories.Add(wasm.MemoryType{Lim: wasm.Limits{Min: 1}})
 	m.Exports.Add("main", wasm.ExportFunc, fnMain)
 
+	// Pack both messages into the active data segment at offset 0.
 	m.Datas.Add(
 		wasm.DataModeActive{MemIdx: 0, Offset: wasm.ConstI32(0)},
 		[]byte(msg1+msg2),
@@ -123,19 +109,21 @@ func buildModule() *wasm.Module {
 func codeMain() *wasm.FunctionBody {
 	b := wasm.NewFunctionBody()
 
+	// write(1, msg1, len(msg1))
 	b.I32Const(1)
 	b.I32Const(msg1Off)
 	b.I32Const(int32(len(msg1)))
 	b.Call(fnWrite)
 	b.Drop()
 
+	// write(1, msg2, len(msg2))
 	b.I32Const(1)
 	b.I32Const(msg2Off)
 	b.I32Const(int32(len(msg2)))
 	b.Call(fnWrite)
 	b.Drop()
 
-	b.I32Const(0)
+	b.I32Const(0) // exit code
 	b.End()
 	return b
 }

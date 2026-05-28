@@ -54,9 +54,9 @@ const (
 
 // nlist_64 n_desc flag bits.
 const (
-	nDescWeakRef   uint16 = 0x0040 // N_WEAK_REF
-	nDescWeakDef   uint16 = 0x0080 // N_WEAK_DEF
-	nDescAltEntry  uint16 = 0x0200 // N_ALT_ENTRY
+	nDescWeakRef  uint16 = 0x0040 // N_WEAK_REF
+	nDescWeakDef  uint16 = 0x0080 // N_WEAK_DEF
+	nDescAltEntry uint16 = 0x0200 // N_ALT_ENTRY
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -103,7 +103,7 @@ func putU64(buf []byte, off int, v uint64) {
 
 // putStr16 writes s zero-padded into a 16-byte field.
 func putStr16(dst []byte, s string) {
-	for i := range 16 {
+	for i := 0; i < 16; i++ {
 		if i < len(s) {
 			dst[i] = s[i]
 		} else {

@@ -2,6 +2,7 @@
 package context
 
 import (
+	"github.com/vertex-language/compiler/abi"
 	"github.com/vertex-language/compiler/decode"
 	"github.com/vertex-language/compiler/object"
 	"github.com/vertex-language/compiler/wasm"
@@ -33,6 +34,12 @@ type BuildContext struct {
 	// parameter type annotations from the export suffix.
 	KernelParams map[int][]string
 
+	// SystemLibs maps a wasm import function index to its resolved system
+	// library entry. Only populated for imports whose RouteKind IsSystemLib().
+	// The driver uses this to emit DT_NEEDED (ELF), LC_LOAD_DYLIB (Mach-O),
+	// or the PE import lib path (COFF) for the call site.
+	SystemLibs map[int]abi.SystemLibResult
+
 	// NeedsMemory flags whether the module imports any "memory" primitives,
 	// signalling the driver to inject the allocator stubs.
 	NeedsMemory bool
@@ -50,6 +57,7 @@ func NewBuildContext(m *wasm.Module, obj object.Object) *BuildContext {
 		ImportHptrMasks: make(map[int][]bool),
 		ReturnHptrMasks: make(map[int]bool),
 		KernelParams:    make(map[int][]string),
+		SystemLibs:      make(map[int]abi.SystemLibResult),
 	}
 }
 

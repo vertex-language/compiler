@@ -3,6 +3,12 @@
 //
 // The import module path is the single source of truth for routing.
 // Parse and ParseExport are the two entry points most callers need.
+//
+// Platform-specific system library resolution tables live in sub-packages:
+//
+//	abi/linux   — LinuxSystemLib candidate paths
+//	abi/windows — WindowsSystemLib candidate paths
+//	abi/darwin  — DarwinSystemLib candidate paths
 package abi
 
 import "strings"
@@ -13,64 +19,71 @@ import "strings"
 type RouteKind int
 
 const (
-	// LinuxSyscall: "linux/kernel/syscalls"
-	// Emit an inline syscall instruction at the call site. No PLT, no libc.
-	LinuxSyscall RouteKind = iota
+	// LinuxKernelSyscall: "linux/kernel/syscalls"
+	// Emit an inline syscall instruction at the call site.
+	// No PLT, no libc, no linker involvement.
+	LinuxKernelSyscall RouteKind = iota
 
-	// LinuxLib: "linux/<lib>"
-	// Link against a Linux system library (glibc / musl). PLT entry.
-	LinuxLib
+	// LinuxSystemLib: "linux/<lib>"
+	// Link against a known Linux system library (glibc / musl).
+	// Candidate paths resolved via abi/linux.
+	LinuxSystemLib
 
-	// WindowsDLL: "windows/<dll>"
-	// Emit an IAT entry. Not valid on non-Windows targets.
-	WindowsDLL
+	// WindowsSystemLib: "windows/<dll>"
+	// Link against a known Windows system DLL via IAT entry.
+	// Candidate paths resolved via abi/windows.
+	// Not valid on non-Windows targets.
+	WindowsSystemLib
 
-	// DarwinLib: "darwin/<lib>"
-	// Emit an LC_LOAD_DYLIB stub. Not valid on non-Darwin targets.
-	DarwinLib
+	// DarwinSystemLib: "darwin/<lib>"
+	// Link against a known macOS system library via LC_LOAD_DYLIB stub.
+	// Candidate paths resolved via abi/darwin.
+	// Not valid on non-Darwin targets.
+	DarwinSystemLib
 
 	// VcpkgLib: "lib/<name>"
-	// Fetched and compiled via vcpkg before linking.
+	// Third-party library fetched and compiled via vcpkg before linking.
 	VcpkgLib
 
-	// BIOSService: "hw/bios/..."
-	// Emit an inline int 0xNN instruction or direct in/out port I/O.
-	// Not yet implemented.
-	BIOSService
+	// MetalBIOS: "hw/bios/..."
+	// Bare-metal BIOS interface. Emits inline int 0xNN instructions or
+	// direct in/out port I/O. Intended for bootloader and firmware targets.
+	MetalBIOS
 
-	// UEFIService: "hw/uefi/..."
-	// Resolve through EFI_SYSTEM_TABLE vtable at the call site.
-	// Not yet implemented.
-	UEFIService
+	// MetalUEFI: "hw/uefi/..."
+	// Bare-metal UEFI firmware interface. Resolves through EFI_SYSTEM_TABLE
+	// vtable at the call site. Intended for bootloader and firmware targets.
+	MetalUEFI
 
 	// GPUIntrinsic: "gpu/cuda" | "gpu/msl" | "gpu/vulkan"
-	// Map to a PTX / MSL / SPIR-V built-in.
-	// Only valid inside a function routed to the matching GPU backend via an
-	// @cuda / @msl / @vulkan export suffix.
+	// Maps to a PTX / MSL / SPIR-V built-in.
+	// Only valid inside a function routed to the matching GPU backend via
+	// a @cuda / @msl / @vulkan export suffix.
 	GPUIntrinsic
 
 	// VertexMemory: "memory"
 	// Internal Vertex allocator. Resolved to __vertex_memory_* stubs.
+	// malloc, free, and mmap imports are compile-time errors — use this instead.
 	VertexMemory
 )
 
-// String returns a human-readable description of a RouteKind, useful in
-// compiler diagnostics.
+// String returns a human-readable description of a RouteKind,
+// useful in compiler diagnostics.
 func (k RouteKind) String() string {
 	switch k {
-	case LinuxSyscall:
+	case LinuxKernelSyscall:
 		return "linux/kernel/syscalls"
-	case LinuxLib:
+	case LinuxSystemLib:
 		return "linux/*"
-	case WindowsDLL:
+	case WindowsSystemLib:
 		return "windows/*"
-	case DarwinLib:
+	case DarwinSystemLib:
 		return "darwin/*"
 	case VcpkgLib:
 		return "lib/*"
-	case BIOSService:
+	case MetalBIOS:
 		return "hw/bios/*"
-	case UEFIService:
+	case MetalUEFI:
 		return "hw/uefi/*"
 	case GPUIntrinsic:
 		return "gpu/*"
@@ -81,6 +94,22 @@ func (k RouteKind) String() string {
 	}
 }
 
+// IsMetal reports whether this route targets bare-metal hardware directly —
+// either BIOS or UEFI. Useful for the driver to gate these on appropriate
+// output types (e.g. raw binary, EFI application) and reject them for
+// standard OS-linked executables.
+func (k RouteKind) IsMetal() bool {
+	return k == MetalBIOS || k == MetalUEFI
+}
+
+// IsSystemLib reports whether this route targets a hardcoded OS system library.
+// The driver resolves the actual path via the platform-specific abi/* sub-package.
+func (k RouteKind) IsSystemLib() bool {
+	return k == LinuxSystemLib || k == WindowsSystemLib || k == DarwinSystemLib
+}
+
+// ─── Import ───────────────────────────────────────────────────────────────────
+
 // Import is the result of parsing a wasm import module path.
 type Import struct {
 	Kind RouteKind
@@ -90,39 +119,40 @@ type Import struct {
 	Vendor string
 
 	// Sub is everything after the first segment, e.g.:
-	//   "kernel/syscalls", "libc", "kernel32", "bios/int10h", "cuda"
+	//   "kernel/syscalls", "libc", "kernel32", "libSystem",
+	//   "bios/int10h", "uefi/boot_services", "cuda"
 	// Empty for the "memory" vendor.
 	Sub string
 }
 
 // Parse maps a wasm import module string to an Import.
-// Unrecognised namespaces return a zero-Kind Import; callers should treat
-// that as a compile error and can use IsUnrecognised to detect it.
+// Unrecognised namespaces return a zero-value Import; callers should
+// use IsUnrecognised to detect and surface this as a compile error.
 func Parse(module string) Import {
 	vendor, sub, _ := strings.Cut(module, "/")
 
 	switch vendor {
 	case "linux":
 		if sub == "kernel/syscalls" {
-			return Import{Kind: LinuxSyscall, Vendor: "linux", Sub: sub}
+			return Import{Kind: LinuxKernelSyscall, Vendor: "linux", Sub: sub}
 		}
-		return Import{Kind: LinuxLib, Vendor: "linux", Sub: sub}
+		return Import{Kind: LinuxSystemLib, Vendor: "linux", Sub: sub}
 
 	case "windows":
-		return Import{Kind: WindowsDLL, Vendor: "windows", Sub: sub}
+		return Import{Kind: WindowsSystemLib, Vendor: "windows", Sub: sub}
 
 	case "darwin":
-		return Import{Kind: DarwinLib, Vendor: "darwin", Sub: sub}
+		return Import{Kind: DarwinSystemLib, Vendor: "darwin", Sub: sub}
 
 	case "lib":
 		return Import{Kind: VcpkgLib, Vendor: "lib", Sub: sub}
 
 	case "hw":
 		if strings.HasPrefix(sub, "bios") {
-			return Import{Kind: BIOSService, Vendor: "hw", Sub: sub}
+			return Import{Kind: MetalBIOS, Vendor: "hw", Sub: sub}
 		}
 		if strings.HasPrefix(sub, "uefi") {
-			return Import{Kind: UEFIService, Vendor: "hw", Sub: sub}
+			return Import{Kind: MetalUEFI, Vendor: "hw", Sub: sub}
 		}
 
 	case "gpu":
@@ -136,8 +166,8 @@ func Parse(module string) Import {
 }
 
 // IsUnrecognised reports whether an Import came back from Parse with a
-// namespace the compiler does not know about. Callers should surface this
-// as a hard compile-time error.
+// namespace the compiler does not know about. Callers should surface
+// this as a hard compile-time error.
 func IsUnrecognised(i Import) bool {
 	switch i.Vendor {
 	case "linux", "windows", "darwin", "lib", "hw", "gpu", "memory":
@@ -160,7 +190,7 @@ func (i Import) GPUBackend() string {
 // Sig is the parsed ABI signature suffix on a wasm import name field.
 //
 //	"write@i32.ptr.i32"       → Sig{Name:"write",  PtrMask:[F,T,F]}
-//	"fopen@ptr.ptr:hptr"      → Sig{Name:"fopen",  PtrMask:[T,T],         RetHptr:true}
+//	"fopen@ptr.ptr:hptr"      → Sig{Name:"fopen",  PtrMask:[T,T],   RetHptr:true}
 //	"fwrite@ptr.i64.i64.hptr" → Sig{Name:"fwrite", HptrMask:[F,F,F,T]}
 //	"getpid"                  → Sig{Name:"getpid"}
 type Sig struct {
@@ -182,8 +212,7 @@ type Sig struct {
 }
 
 // HasPointers reports whether the signature contains any ptr or hptr
-// parameters, or an hptr return. Used to decide whether the @ suffix
-// and pointer-translation machinery are needed.
+// parameters, or an hptr return.
 func (s Sig) HasPointers() bool {
 	for _, v := range s.PtrMask {
 		if v {
@@ -297,14 +326,14 @@ type Export struct {
 
 	// Params holds the parameter type tokens from the optional :type.type...
 	// annotation, e.g. ["ptr", "i32"] from "@cuda:ptr.i32".
-	// Nil for ExportCPU and for GPU/concurrency exports with no type list.
+	// Nil for ExportCPU and for exports with no type list.
 	Params []string
 }
 
 // ParseExport parses the name field of a wasm export declaration.
 // Exports without an @-suffix are returned with Kind == ExportCPU.
-// An unrecognised @-suffix also returns ExportCPU so the function stays on
-// the CPU routing table; the driver will warn separately if needed.
+// An unrecognised @-suffix also returns ExportCPU so the function stays
+// on the CPU routing table; the driver will warn separately if needed.
 func ParseExport(name string) Export {
 	base, suffix, hasSuffix := strings.Cut(name, "@")
 	if !hasSuffix || suffix == "" {

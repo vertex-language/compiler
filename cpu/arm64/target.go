@@ -230,7 +230,7 @@ func (t *Target) buildImportInfo(ctx *context.BuildContext) (
 		sig := abi.ParseSig(e.Name)
 
 		switch route.Kind {
-		case abi.LinuxSyscall:
+		case abi.LinuxKernelSyscall:
 			if n, ok := linuxabi.SyscallNumber(sig.Name, "arm64"); ok {
 				inlined[funcIdx] = inlinedImport{
 					module: e.Module, name: sig.Name, number: n, ptrMask: sig.PtrMask,
@@ -238,7 +238,7 @@ func (t *Target) buildImportInfo(ctx *context.BuildContext) (
 			}
 			importNames = append(importNames, "")
 
-		case abi.LinuxLib:
+		case abi.LinuxSystemLib:
 			importNames = append(importNames, sig.Name)
 
 		case abi.VcpkgLib:
@@ -252,17 +252,17 @@ func (t *Target) buildImportInfo(ctx *context.BuildContext) (
 			importNames = append(importNames,
 				"__vertex_memory_"+strings.ReplaceAll(sig.Name, ".", "_"))
 
-		case abi.WindowsDLL:
+		case abi.WindowsSystemLib:
 			err = fmt.Errorf("arm64: %s::%s — windows/* imports not valid on this target", e.Module, sig.Name)
 			return
-		case abi.DarwinLib:
+		case abi.DarwinSystemLib:
 			// Darwin/arm64 is a valid combination but handled by a separate target.
 			err = fmt.Errorf("arm64: %s::%s — darwin/* imports require the darwin/arm64 target", e.Module, sig.Name)
 			return
-		case abi.BIOSService:
+		case abi.MetalBIOS:
 			err = fmt.Errorf("arm64: %s::%s — hw/bios not yet implemented", e.Module, sig.Name)
 			return
-		case abi.UEFIService:
+		case abi.MetalUEFI:
 			err = fmt.Errorf("arm64: %s::%s — hw/uefi not yet implemented", e.Module, sig.Name)
 			return
 		case abi.GPUIntrinsic:

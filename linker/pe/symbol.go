@@ -1,6 +1,9 @@
 package pe
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // symKind is the resolution kind of a symbol in the global table.
 type symKind int
@@ -299,7 +302,6 @@ func (st *SymbolTable) ingestImportStub(imp *ShortImport) {
 	}
 
 	// For IMPORT_CODE (0) and IMPORT_DATA (1): also define the undecorated symbol.
-	// For IMPORT_CODE: will become a thunk; for IMPORT_DATA: alias for __imp_.
 	if imp.ImportType == 0 || imp.ImportType == 1 {
 		ts := st.get(imp.SymName)
 		if ts.kind == symUndefined {
@@ -364,8 +366,3 @@ func (st *SymbolTable) Lookup(name string) uint64 {
 	}
 	return 0
 }
-
-// needed to break circular import with strings package
-var strings_EqualFold = strings.EqualFold
-
-func init() { _ = strings_EqualFold } // ensure strings import kept

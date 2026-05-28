@@ -79,7 +79,7 @@ func segIndex(name string) int {
 			return i
 		}
 	}
-	return len(segOrder) // unknown segments go last (before LINKEDIT)
+	return len(segOrder)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -89,15 +89,14 @@ func segIndex(name string) int {
 // MergeSections combines all input sections by (SegName, SectName) key and
 // produces a Layout.  Metadata sections (debug, symtab, etc.) are skipped.
 func MergeSections(objects []*ObjectFile) (*Layout, error) {
-	merged := make(map[string]*MergedSection) // key = "__SEG,__sect"
-	var order []string                        // insertion order for determinism
+	merged := make(map[string]*MergedSection)
+	var order []string
 
 	for _, obj := range objects {
 		for _, sec := range obj.Sections {
 			if sec == nil {
 				continue
 			}
-			// Skip metadata/debug sections.
 			if shouldSkipSection(sec) {
 				continue
 			}
@@ -118,15 +117,12 @@ func MergeSections(objects []*ObjectFile) (*Layout, error) {
 				merged[key] = ms
 				order = append(order, key)
 			} else {
-				// Max alignment.
 				if sec.Align > ms.Align {
 					ms.Align = sec.Align
 				}
-				// Merge attributes (OR).
 				ms.Attrs |= sec.Flags &^ 0xff
 			}
 
-			// Align current size before appending.
 			alignedOff := alignUp64(ms.Size, uint64(sec.Align))
 			if sec.Align < 1 {
 				alignedOff = ms.Size
@@ -142,7 +138,6 @@ func MergeSections(objects []*ObjectFile) (*Layout, error) {
 			if ms.IsZerofill() {
 				ms.Size = alignedOff + sec.Size
 			} else {
-				// Append data (with alignment padding).
 				padLen := int(alignedOff) - len(ms.Data)
 				if padLen > 0 {
 					ms.Data = append(ms.Data, make([]byte, padLen)...)
@@ -153,7 +148,6 @@ func MergeSections(objects []*ObjectFile) (*Layout, error) {
 		}
 	}
 
-	// Build the flat section list in segment + canonical order.
 	sort.Slice(order, func(i, j int) bool {
 		ki, kj := order[i], order[j]
 		si, sj := merged[ki], merged[kj]
@@ -180,7 +174,6 @@ func MergeSections(objects []*ObjectFile) (*Layout, error) {
 		seg.Sections = append(seg.Sections, ms)
 	}
 
-	// Sort segments canonically.
 	sort.Slice(layout.Segments, func(i, j int) bool {
 		return segIndex(layout.Segments[i].Name) < segIndex(layout.Segments[j].Name)
 	})
@@ -191,17 +184,10 @@ func MergeSections(objects []*ObjectFile) (*Layout, error) {
 // shouldSkipSection returns true for sections the linker synthesises itself
 // or that should not appear in the merged output.
 func shouldSkipSection(s *RawSection) bool {
-	// Skip debug / DWARF sections.
-	if s.Attrs&0x02000000 != 0 { // S_ATTR_DEBUG
+	// S_ATTR_DEBUG lives in the high bits of the Flags word (bit 25).
+	if s.Flags&0x02000000 != 0 {
 		return true
 	}
-	switch s.SectName {
-	case "__eh_frame":
-		// Keep — needed for unwinding.
-		return false
-	}
-	// Skip sections from the empty segment (shouldn't occur in 64-bit MH_OBJECT
-	// but just in case).
 	return false
 }
 

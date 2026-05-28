@@ -28,10 +28,10 @@ const (
 type BindSpecial int
 
 const (
-	BindSpecialSelf        BindSpecial = 0  // BIND_SPECIAL_DYLIB_SELF
-	BindSpecialMainExec    BindSpecial = -1 // BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE
-	BindSpecialFlatLookup  BindSpecial = -2 // BIND_SPECIAL_DYLIB_FLAT_LOOKUP
-	BindSpecialWeakLookup  BindSpecial = -3 // BIND_SPECIAL_DYLIB_WEAK_LOOKUP
+	BindSpecialSelf       BindSpecial = 0  // BIND_SPECIAL_DYLIB_SELF
+	BindSpecialMainExec   BindSpecial = -1 // BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE
+	BindSpecialFlatLookup BindSpecial = -2 // BIND_SPECIAL_DYLIB_FLAT_LOOKUP
+	BindSpecialWeakLookup BindSpecial = -3 // BIND_SPECIAL_DYLIB_WEAK_LOOKUP
 )
 
 // ExportFlags is an EXPORT_SYMBOL_FLAGS_* bitmask stored in the export trie.
@@ -39,8 +39,8 @@ type ExportFlags uint64
 
 const (
 	// Kind bits (low 2 bits).
-	ExportKindRegular    ExportFlags = 0x00 // EXPORT_SYMBOL_FLAGS_KIND_REGULAR
-	ExportKindAbsolute   ExportFlags = 0x02 // EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE
+	ExportKindRegular     ExportFlags = 0x00 // EXPORT_SYMBOL_FLAGS_KIND_REGULAR
+	ExportKindAbsolute    ExportFlags = 0x02 // EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE
 	ExportKindThreadLocal ExportFlags = 0x03 // EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL
 
 	// Attribute bits.
@@ -65,8 +65,8 @@ type RebaseEntry struct {
 
 // BindEntry is one external-symbol binding operation.
 type BindEntry struct {
-	SegIndex   int
-	SegOffset  uint64
+	SegIndex  int
+	SegOffset uint64
 	// LibOrdinal is 1-based (index into the LC_LOAD_DYLIB list) or a
 	// BindSpecial* value (cast to int).
 	LibOrdinal int
@@ -81,7 +81,7 @@ type BindEntry struct {
 
 // ExportEntry is one symbol exported by this image via the export trie.
 type ExportEntry struct {
-	Name    string
+	Name string
 	// Address is the VM offset from the image base (slide not included).
 	// Set to 0 for re-export entries.
 	Address uint64
@@ -109,9 +109,9 @@ type ExportEntry struct {
 // For modern targets prefer ChainedFixupsBuilder (LC_DYLD_CHAINED_FIXUPS)
 // paired with the export trie from this builder.
 type DyldInfoBuilder struct {
-	rebases  []RebaseEntry
-	binds    []BindEntry
-	exports  []ExportEntry
+	rebases []RebaseEntry
+	binds   []BindEntry
+	exports []ExportEntry
 }
 
 // NewDyldInfoBuilder returns a DyldInfoBuilder ready to accept entries.
@@ -184,22 +184,22 @@ func (d *DyldInfoBuilder) buildRebase() []byte {
 // ─── bind opcodes ─────────────────────────────────────────────────────────────
 
 const (
-	bindOpcDone                      = 0x00
-	bindOpcSetDylibOrdinalImm        = 0x10
-	bindOpcSetDylibOrdinalULEB       = 0x20
-	bindOpcSetDylibSpecialImm        = 0x30
-	bindOpcSetSymbolTrailingFlagsImm = 0x40
-	bindOpcSetTypeImm                = 0x50
-	bindOpcSetAddendSLEB             = 0x60
-	bindOpcSetSegAndOffULEB          = 0x70
-	bindOpcAddAddrULEB               = 0x80
-	bindOpcDoBind                    = 0x90
-	bindOpcDoBindAddAddrULEB         = 0xa0
-	bindOpcDoBindAddAddrImmScaled    = 0xb0
+	bindOpcDone                        = 0x00
+	bindOpcSetDylibOrdinalImm          = 0x10
+	bindOpcSetDylibOrdinalULEB         = 0x20
+	bindOpcSetDylibSpecialImm          = 0x30
+	bindOpcSetSymbolTrailingFlagsImm   = 0x40
+	bindOpcSetTypeImm                  = 0x50
+	bindOpcSetAddendSLEB               = 0x60
+	bindOpcSetSegAndOffULEB            = 0x70
+	bindOpcAddAddrULEB                 = 0x80
+	bindOpcDoBind                      = 0x90
+	bindOpcDoBindAddAddrULEB           = 0xa0
+	bindOpcDoBindAddAddrImmScaled      = 0xb0
 	bindOpcDoBindULEBTimesSkippingULEB = 0xc0
 
-	bindSymFlagWeakImport      = 0x01
-	bindSymFlagNonWeakDef      = 0x08
+	bindSymFlagWeakImport = 0x01
+	bindSymFlagNonWeakDef = 0x08
 )
 
 func (d *DyldInfoBuilder) buildBindTables() (bind, weakBind, lazyBind []byte) {
@@ -368,7 +368,7 @@ func longestCommonPrefix(exports []ExportEntry, base string) string {
 	ref := exports[0].Name
 	end := len(ref)
 	for _, e := range exports[1:] {
-		for i := range end {
+		for i := 0; i < end; i++ {
 			if i >= len(e.Name) || e.Name[i] != ref[i] {
 				end = i
 				break
@@ -400,7 +400,7 @@ func trieNodeSize(node *trieNode) uint32 {
 	sz++ // child count byte
 	for _, child := range node.children {
 		edge := child.prefix[len(node.prefix):]
-		sz += uint32(len(edge)) + 1            // edge string + NUL
+		sz += uint32(len(edge)) + 1 // edge string + NUL
 		sz += uint32(len(appendULEB128(nil, uint64(child.offset))))
 	}
 	return sz

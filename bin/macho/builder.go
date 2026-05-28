@@ -259,7 +259,7 @@ func (b *Builder) Emit() ([]byte, error) {
 		size    uint64 // byte count (0 for zerofill)
 	}
 
-	fileOff := alignUp(headerAndLC, PageSize) // ← was pageSize
+	fileOff := alignUp(headerAndLC, PageSize)
 	vmAddr := baseVA
 
 	var layouts []sectionLayout
@@ -486,25 +486,25 @@ func (b *Builder) Emit() ([]byte, error) {
 	}
 
 	// ── Phase 6: assign __LINKEDIT offsets ───────────────────────────────────
-	linkeditFileStart := alignUp(fileOff, PageSize) // ← was pageSize
-	linkeditVMAddr := alignUp(vmAddr, PageSize)     // ← was pageSize
+	linkeditFileStart := alignUp(fileOff, PageSize)
+	linkeditVMAddr := alignUp(vmAddr, PageSize)
 
 	cur := linkeditFileStart
 
 	var (
-		rebaseOff, rebaseSz             uint32
-		bindOff, bindSz                 uint32
-		weakBindOff, weakBindSz         uint32
-		lazyBindOff, lazyBindSz         uint32
-		exportOff, exportSz             uint32
+		rebaseOff, rebaseSz               uint32
+		bindOff, bindSz                   uint32
+		weakBindOff, weakBindSz           uint32
+		lazyBindOff, lazyBindSz           uint32
+		exportOff, exportSz               uint32
 		chainedFixupsOff, chainedFixupsSz uint32
-		exportTrieOff, exportTrieSz     uint32
-		funcStartsOff, funcStartsSz     uint32
-		dataInCodeOff, dataInCodeSz     uint32
-		symOff, symSz                   uint32
-		indirSymOff, indirSymSz         uint32
-		strOff                          uint32
-		codeSignOff                     uint32
+		exportTrieOff, exportTrieSz       uint32
+		funcStartsOff, funcStartsSz       uint32
+		dataInCodeOff, dataInCodeSz       uint32
+		symOff                            uint32 // symSz removed: computed locally and not reused
+		indirSymOff, indirSymSz           uint32
+		strOff                            uint32
+		codeSignOff                       uint32
 	)
 
 	assign := func(data []byte, off *uint32, sz *uint32, align uint64) {
@@ -544,7 +544,6 @@ func (b *Builder) Emit() ([]byte, error) {
 	symSzU := uint64(len(allSyms)) * sizeofNlist64
 	cur = alignUp(cur, 8)
 	symOff = uint32(cur)
-	symSz = uint32(symSzU)
 	cur += symSzU
 
 	// Indirect symbol table.
@@ -643,7 +642,7 @@ func (b *Builder) Emit() ([]byte, error) {
 			vmStart = vmAddr
 			fileStart = fileOff
 		}
-		vmSize := alignUp(vmEnd-vmStart, PageSize) // ← was pageSize
+		vmSize := alignUp(vmEnd-vmStart, PageSize)
 		fileSize := fileEnd - fileStart
 
 		maxProt := seg.MaxProt
@@ -701,7 +700,7 @@ func (b *Builder) Emit() ([]byte, error) {
 
 	// __LINKEDIT.
 	lcOff = emitSegmentCommand64(out, lcOff, "__LINKEDIT",
-		linkeditVMAddr, alignUp(linkeditSize, PageSize), // ← was pageSize
+		linkeditVMAddr, alignUp(linkeditSize, PageSize),
 		linkeditFileStart, linkeditSize,
 		ProtRead, ProtRead, 0, 0)
 
@@ -1025,6 +1024,7 @@ func (b *Builder) countLoadCommands(
 	_, _ uint32,
 	_, _ uint32,
 	_, _ uint32,
+	_, _ uint32, // nLocalSyms, nExtSyms
 	_ uint64,
 ) (ncmds int, sizeofcmds int) {
 	raw := b.computeLoadCommandSize()

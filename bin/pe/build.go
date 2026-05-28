@@ -106,35 +106,37 @@ func (b *Builder) buildImage() (*PEImage, error) {
 
 	// Synthetic section layout placeholders.
 	var (
-		idataLayout    sectionLayout
-		edataLayout    sectionLayout
-		delayLayout    sectionLayout
-		pdataLayout    sectionLayout
-		xdataLayout    sectionLayout
-		tlsLayout      sectionLayout
-		loadCfgLayout  sectionLayout
-		debugLayout    sectionLayout
-		relocLayout    sectionLayout
+		idataLayout   sectionLayout
+		edataLayout   sectionLayout
+		delayLayout   sectionLayout
+		pdataLayout   sectionLayout
+		xdataLayout   sectionLayout
+		tlsLayout     sectionLayout
+		loadCfgLayout sectionLayout
+		debugLayout   sectionLayout
+		relocLayout   sectionLayout
 	)
 
 	if needsIdata {
 		idataLayout = sectionLayout{
-			name: ".idata", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+			name:  ".idata",
+			chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
 			virtualAddr: va, virtualSize: idataPreSize,
 		}
 		va = align32(va+idataPreSize, sectionAlignment)
 	}
 	if needsEdata {
 		edataLayout = sectionLayout{
-			name: ".edata", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+			name:  ".edata",
+			chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
 			virtualAddr: va, virtualSize: edataPreSize,
 		}
 		va = align32(va+edataPreSize, sectionAlignment)
 	}
 	if needsDelayIdata {
-		// Placeholder; actual size computed in step 8.
 		delayLayout = sectionLayout{
-			name: ".didat", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+			name:  ".didat",
+			chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
 			virtualAddr: va,
 		}
 		va = align32(va+4096, sectionAlignment) // conservative pre-size
@@ -142,23 +144,25 @@ func (b *Builder) buildImage() (*PEImage, error) {
 	if needsPdata {
 		pdataSz := uint32(len(b.pdataFuncs) * 12)
 		pdataLayout = sectionLayout{
-			name: ".pdata", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+			name:  ".pdata",
+			chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
 			virtualAddr: va, virtualSize: pdataSz,
 		}
 		va = align32(va+pdataSz, sectionAlignment)
 	}
 	if len(b.xdataBlob) > 0 {
 		xdataLayout = sectionLayout{
-			name: ".xdata", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+			name:  ".xdata",
+			chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
 			virtualAddr: va, virtualSize: uint32(len(b.xdataBlob)),
 		}
 		va = align32(va+uint32(len(b.xdataBlob)), sectionAlignment)
 	}
 	if needsTLS {
-		// TLS section: 8-byte IMAGE_TLS_DIRECTORY64 + template data + callback array.
 		tlsSz := uint32(40 + len(b.tlsData) + (len(b.tlsCallbacks)+1)*8)
 		tlsLayout = sectionLayout{
-			name: ".tls", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
+			name:  ".tls",
+			chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
 			virtualAddr: va, virtualSize: tlsSz,
 		}
 		va = align32(va+tlsSz, sectionAlignment)
@@ -166,7 +170,8 @@ func (b *Builder) buildImage() (*PEImage, error) {
 	if needsLoadCfg {
 		lcSz := uint32(loadConfigSize)
 		loadCfgLayout = sectionLayout{
-			name: ".rdata$lc", chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+			name:  ".rdata$lc",
+			chars: IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
 			virtualAddr: va, virtualSize: lcSz,
 		}
 		va = align32(va+lcSz, sectionAlignment)
@@ -174,7 +179,8 @@ func (b *Builder) buildImage() (*PEImage, error) {
 	if needsDebug {
 		debugSz := buildDebugSectionSize(b.debugEntries)
 		debugLayout = sectionLayout{
-			name: ".debug", chars: ScnDiscardable,
+			name:  ".debug",
+			chars: ScnDiscardable,
 			virtualAddr: va, virtualSize: debugSz,
 		}
 		va = align32(va+debugSz, sectionAlignment)
@@ -193,10 +199,7 @@ func (b *Builder) buildImage() (*PEImage, error) {
 	}
 
 	// ── Step 7: Collect base-reloc entries ────────────────────────────────────
-	type baseRelocEntry struct {
-		rva uint32
-		typ uint8
-	}
+	// NOTE: baseRelocEntry is the package-level type defined in basereloc.go.
 	var baseRelocs []baseRelocEntry
 
 	// ── Step 8: Build synthetic sections with final VAs ───────────────────────
@@ -213,6 +216,8 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pe: building .edata: %w", err)
 		}
+		// Fix up the section-relative pointers stored by buildEDATA into real RVAs.
+		fixupEDATA(eb, edataLayout.virtualAddr)
 		edataLayout.data = eb
 		edataLayout.virtualSize = uint32(len(eb))
 	}
@@ -223,8 +228,6 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		}
 		delayLayout.data = ddat.flat()
 		delayLayout.virtualSize = uint32(len(delayLayout.data))
-		// Module handles in .data are zeroed at runtime; no base relocs needed for
-		// the RVA-based v2 descriptor format.
 	}
 	if needsPdata {
 		pdataLayout.data = buildPdataSection(b.pdataFuncs)
@@ -237,9 +240,9 @@ func (b *Builder) buildImage() (*PEImage, error) {
 			imageBase, tlsLayout.virtualAddr)
 		tlsLayout.data = tlsData
 		tlsLayout.virtualSize = uint32(len(tlsData))
-		// Image base is in TLS directory VAs; add base relocations.
+		// TLS directory VAs require base relocations for ASLR.
 		tlsDirVA := tlsLayout.virtualAddr
-		for _, off := range []uint32{0, 8, 16, 24} { // StartAddr, EndAddr, IndexAddr, Callbacks
+		for _, off := range []uint32{0, 8, 16, 24} {
 			if off < 24 || tlsDir.AddressOfCallbacks != 0 {
 				baseRelocs = append(baseRelocs, baseRelocEntry{tlsDirVA + off, IMAGE_REL_BASED_DIR64})
 			}
@@ -258,7 +261,8 @@ func (b *Builder) buildImage() (*PEImage, error) {
 	if needsReloc {
 		relocData = buildBaseReloc(baseRelocs)
 		relocLayout = sectionLayout{
-			name: ".reloc", chars: ScnDiscardable,
+			name:  ".reloc",
+			chars: ScnDiscardable,
 			virtualAddr: relocVA, virtualSize: uint32(len(relocData)),
 			data: relocData,
 		}
@@ -295,7 +299,7 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		all = append(all, relocLayout)
 	}
 
-	// ── Step 10: SizeOfImage ─────────────────────────────────────────────────
+	// ── Step 10: SizeOfImage ──────────────────────────────────────────────────
 	sizeOfImage := align32(sizeOfHeaders, sectionAlignment)
 	for _, lay := range all {
 		if end := align32(lay.virtualAddr+lay.virtualSize, sectionAlignment); end > sizeOfImage {
@@ -339,8 +343,6 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		dataDirs[DataDirLoadConfig] = DataDirectory{loadCfgLayout.virtualAddr, loadConfigSize}
 	}
 	if needsDebug {
-		// The debug data directory points to the first IMAGE_DEBUG_DIRECTORY entry;
-		// size covers all N entries (each 28 bytes).
 		dataDirs[DataDirDebug] = DataDirectory{
 			debugLayout.virtualAddr,
 			uint32(len(b.debugEntries) * 28),
@@ -348,6 +350,13 @@ func (b *Builder) buildImage() (*PEImage, error) {
 	}
 	if needsReloc {
 		dataDirs[DataDirBaseReloc] = DataDirectory{relocLayout.virtualAddr, relocLayout.virtualSize}
+	}
+
+	// Apply any caller-supplied overrides (e.g. for sections added via AddSection).
+	for i, dd := range b.extraDataDirs {
+		if dd.VirtualAddress != 0 || dd.Size != 0 {
+			dataDirs[i] = dd
+		}
 	}
 
 	// ── Step 13: File characteristics ────────────────────────────────────────
@@ -371,7 +380,7 @@ func (b *Builder) buildImage() (*PEImage, error) {
 		}
 	}
 
-	_ = le // binary.LittleEndian used in sub-functions
+	_ = le // used in sub-functions
 
 	return &PEImage{
 		Machine:               b.machine,

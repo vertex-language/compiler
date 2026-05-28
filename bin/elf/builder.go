@@ -7,7 +7,6 @@ import (
 	"fmt"
 )
 
-// Fixed ELF64 structure sizes (bytes).
 const (
 	elfHeaderSize = 64
 	phdrEntrySize = 56
@@ -17,27 +16,23 @@ const (
 	dynEntrySize  = 16
 )
 
-// Default load address for position-dependent executables on Linux.
 const defaultBase uint64 = 0x400000
-
-// pageSize is the minimum segment alignment for PT_LOAD segments.
 const pageSize uint64 = 0x1000
 
-// Arch identifies the target machine architecture written into e_machine.
 type Arch uint16
 
 const (
-	ArchAMD64   Arch = EM_X86_64  // 0x3E
-	ArchARM64   Arch = EM_AARCH64 // 0xB7
-	ArchRISCV64 Arch = EM_RISCV   // 0xF3
+	ArchAMD64   Arch = EM_X86_64
+	ArchARM64   Arch = EM_AARCH64
+	ArchRISCV64 Arch = EM_RISCV
 )
 
 // Builder accumulates sections, symbols, and relocations and serializes them
 // into a valid ELF64 binary via Emit.
 type Builder struct {
 	arch     Arch
-	fileType uint16 // ET_EXEC or ET_DYN
-	flags    uint32 // e_flags; use EF_RISCV_* for RISC-V targets
+	fileType uint16
+	flags    uint32
 	entry    string
 
 	sections      []Section
@@ -45,52 +40,32 @@ type Builder struct {
 	relocs        []Reloc
 	extraSegments []Segment
 
-	// Dynamic linking fields.
-	interp string   // PT_INTERP path
-	needed []string // DT_NEEDED library names
-	soname string   // DT_SONAME
-	rpath  string   // DT_RUNPATH
+	interp  string
+	needed  []string
+	soname  string
+	rpath   string
+	dynSyms []string // PLT symbol names for .dynsym, in stub order
 }
 
-// NewBuilder returns a Builder targeting arch. Default output type is a
-// position-dependent static executable (ET_EXEC).
 func NewBuilder(arch Arch) *Builder {
 	return &Builder{arch: arch, fileType: ET_EXEC}
 }
 
-// SetShared switches the output type to a shared library (ET_DYN).
-func (b *Builder) SetShared() { b.fileType = ET_DYN }
+func (b *Builder) SetShared()              { b.fileType = ET_DYN }
+func (b *Builder) SetFlags(f uint32)       { b.flags = f }
+func (b *Builder) SetInterp(path string)   { b.interp = path }
+func (b *Builder) AddNeeded(lib string)    { b.needed = append(b.needed, lib) }
+func (b *Builder) SetSoname(name string)   { b.soname = name }
+func (b *Builder) SetRpath(path string)    { b.rpath = path }
+func (b *Builder) AddSection(s Section)   { b.sections = append(b.sections, s) }
+func (b *Builder) AddSymbol(s Symbol)     { b.symbols = append(b.symbols, s) }
+func (b *Builder) AddReloc(r Reloc)       { b.relocs = append(b.relocs, r) }
+func (b *Builder) SetEntry(name string)   { b.entry = name }
 
-// SetFlags sets the processor-specific e_flags field. Required for RISC-V
-// targets (see EF_RISCV_*); ignored but harmless for AMD64 and ARM64.
-func (b *Builder) SetFlags(f uint32) { b.flags = f }
-
-// SetInterp sets the dynamic-linker interpreter path, which implies a
-// PT_INTERP segment. Typical value: "/lib64/ld-linux-x86-64.so.2".
-func (b *Builder) SetInterp(path string) { b.interp = path }
-
-// AddNeeded records a DT_NEEDED dependency on lib (e.g. "libc.so.6").
-func (b *Builder) AddNeeded(lib string) { b.needed = append(b.needed, lib) }
-
-// SetSoname sets the shared-library DT_SONAME tag.
-func (b *Builder) SetSoname(name string) { b.soname = name }
-
-// SetRpath sets the DT_RUNPATH runtime library search path.
-func (b *Builder) SetRpath(path string) { b.rpath = path }
-
-// AddSection appends a section. Allocatable sections (SHF_ALLOC) are
-// automatically grouped into PT_LOAD segments by permission flags.
-func (b *Builder) AddSection(s Section) { b.sections = append(b.sections, s) }
-
-// AddSymbol records a symbol for the .symtab section.
-func (b *Builder) AddSymbol(s Symbol) { b.symbols = append(b.symbols, s) }
-
-// AddReloc records a RELA relocation for the named section.
-func (b *Builder) AddReloc(r Reloc) { b.relocs = append(b.relocs, r) }
-
-// SetEntry names the entry-point symbol. Emit returns an error if the symbol
-// cannot be resolved to a virtual address.
-func (b *Builder) SetEntry(name string) { b.entry = name }
+// AddDynSym registers name as a global undefined symbol in .dynsym.
+// Call once per PLT symbol in stub order; the resulting .dynsym indices must
+// match the symIdx values encoded in .rela.plt (entry i → symIdx i+1).
+func (b *Builder) AddDynSym(name string) { b.dynSyms = append(b.dynSyms, name) }
 
 // Emit serializes the binary and returns its raw bytes.
 func (b *Builder) Emit() ([]byte, error) {
@@ -107,16 +82,22 @@ type builtSection struct {
 	shType  uint32
 	flags   uint64
 	data    []byte
-	memSize uint64 // equals len(data) unless SHT_NOBITS
+	memSize uint64
 	align   uint64
 	link    uint32
 	info    uint32
 	entSize uint64
-	// Populated by layoutSections:
 	fileOff uint64
 	addr    uint64
-	// Index in the section header table.
-	shIdx int
+	shIdx   int
+
+	// When set, layoutSections uses these values directly instead of computing
+	// new addresses. Populated from Section.PreassignedAddr/FileOffset so that
+	// linker-patched section bytes are serialized at the exact addresses the
+	// linker used when patching.
+	hasPreassigned        bool
+	preassignedAddr       uint64
+	preassignedFileOffset uint64
 }
 
 type emitter struct {
@@ -136,15 +117,11 @@ func (e *emitter) addSec(sec *builtSection) {
 	}
 }
 
-// ── emit orchestrates all passes ─────────────────────────────────────────────
-
 func (e *emitter) emit() ([]byte, error) {
 	// ── Pass 1: collect sections ──────────────────────────────────────────
 
-	// Index 0: mandatory null section.
 	e.addSec(&builtSection{shType: SHT_NULL, align: 1})
 
-	// User-provided sections.
 	for _, s := range e.b.sections {
 		align := s.Align
 		if align == 0 {
@@ -154,7 +131,7 @@ func (e *emitter) emit() ([]byte, error) {
 		if s.Type == SHT_NOBITS && s.Size > memSz {
 			memSz = s.Size
 		}
-		e.addSec(&builtSection{
+		bs := &builtSection{
 			name:    s.Name,
 			shType:  s.Type,
 			flags:   s.Flags,
@@ -164,16 +141,20 @@ func (e *emitter) emit() ([]byte, error) {
 			link:    s.Link,
 			info:    s.Info,
 			entSize: s.EntSize,
-		})
+		}
+		if s.PreassignedAddr != 0 || s.PreassignedFileOffset != 0 {
+			bs.hasPreassigned        = true
+			bs.preassignedAddr       = s.PreassignedAddr
+			bs.preassignedFileOffset = s.PreassignedFileOffset
+		}
+		e.addSec(bs)
 	}
 
-	// Group caller relocations by target section name.
 	relaMap := make(map[string][]Reloc)
 	for _, r := range e.b.relocs {
 		relaMap[r.Section] = append(relaMap[r.Section], r)
 	}
 
-	// Placeholder .rela.* sections (data filled after symbol resolution).
 	type relaEntry struct {
 		targetName string
 		bs         *builtSection
@@ -191,7 +172,6 @@ func (e *emitter) emit() ([]byte, error) {
 		relaEntries = append(relaEntries, relaEntry{targetName, bs})
 	}
 
-	// Dynamic sections (when dynamic linking is requested).
 	hasDynamic := e.b.interp != "" || len(e.b.needed) > 0 ||
 		e.b.soname != "" || e.b.rpath != "" || e.b.fileType == ET_DYN
 	var dynSec *builtSection
@@ -207,7 +187,6 @@ func (e *emitter) emit() ([]byte, error) {
 				align:   1,
 			})
 		}
-		// .dynstr and .dynamic content are built in Pass 4.
 		e.addSec(&builtSection{
 			name:   ".dynstr",
 			shType: SHT_STRTAB,
@@ -232,7 +211,6 @@ func (e *emitter) emit() ([]byte, error) {
 		e.addSec(dynSec)
 	}
 
-	// Non-allocatable metadata sections.
 	symtabSec := &builtSection{
 		name:    ".symtab",
 		shType:  SHT_SYMTAB,
@@ -264,7 +242,7 @@ func (e *emitter) emit() ([]byte, error) {
 	shstrtabSec.memSize = uint64(len(shstrtabSec.data))
 
 	// ── Pass 3: build .symtab and .strtab ─────────────────────────────────
-	e.strtab.add("") // index 0 = empty string
+	e.strtab.add("")
 	var localSyms, globalSyms []Symbol
 	for _, sym := range e.b.symbols {
 		if sym.Weak || sym.Global {
@@ -273,10 +251,10 @@ func (e *emitter) emit() ([]byte, error) {
 			localSyms = append(localSyms, sym)
 		}
 	}
-	firstGlobal := 1 + len(localSyms) // +1 for null entry
+	firstGlobal := 1 + len(localSyms)
 
 	var symBuf bytes.Buffer
-	symBuf.Write(make([]byte, symEntrySize)) // null entry
+	symBuf.Write(make([]byte, symEntrySize))
 	for _, sym := range append(localSyms, globalSyms...) {
 		e.appendSym(&symBuf, sym)
 	}
@@ -288,22 +266,20 @@ func (e *emitter) emit() ([]byte, error) {
 	strtabSec.data = e.strtab.bytes()
 	strtabSec.memSize = uint64(len(strtabSec.data))
 
-	// ── Pass 4: build dynamic sections ────────────────────────────────────
+	// ── Pass 4: first-pass dynamic sections (establishes sizes) ───────────
 	if hasDynamic {
 		e.buildDynamicSections(dynSec)
 	}
 
-	// ── Pass 5: layout — assign file offsets and virtual addresses ─────────
+	// ── Pass 5: layout ─────────────────────────────────────────────────────
 	estimatedPhdrs := e.estimatePhdrs(hasDynamic)
 	headerArea := uint64(elfHeaderSize) + uint64(estimatedPhdrs)*phdrEntrySize
-
 	e.layoutSections(headerArea)
 
 	// ── Pass 6: resolve symbol virtual addresses ───────────────────────────
 	for _, sym := range e.b.symbols {
 		switch sym.Section {
 		case "":
-			// SHN_UNDEF; no address
 		case "*ABS*":
 			e.symAddr[sym.Name] = sym.Offset
 		default:
@@ -322,8 +298,17 @@ func (e *emitter) emit() ([]byte, error) {
 	symtabSec.data = symBuf.Bytes()
 	symtabSec.memSize = uint64(len(symtabSec.data))
 
-	// Re-layout to pick up any size changes in non-alloc sections.
 	e.layoutSections(headerArea)
+
+	// ── Pass 4b: rebuild dynamic sections with final addresses ─────────────
+	// buildDynamicSections reads sec.addr for .dynstr and .dynsym to set
+	// DT_STRTAB / DT_SYMTAB. Those addresses are 0 on the first pass since
+	// .dynstr and .dynsym are bin/elf-internal sections laid out by Pass 5.
+	// After re-layout those addresses are final, so this pass produces the
+	// correct .dynamic content.
+	if hasDynamic {
+		e.buildDynamicSections(dynSec)
+	}
 
 	// ── Pass 8: build .rela.* section data ────────────────────────────────
 	symNameIdx := e.buildSymNameIdx(localSyms, globalSyms)
@@ -352,10 +337,13 @@ func (e *emitter) emit() ([]byte, error) {
 	if len(phdrs) != estimatedPhdrs {
 		headerArea = uint64(elfHeaderSize) + uint64(len(phdrs))*phdrEntrySize
 		e.layoutSections(headerArea)
+		if hasDynamic {
+			e.buildDynamicSections(dynSec)
+		}
 		phdrs = e.buildPhdrs(hasDynamic)
 	}
 
-	// ── Pass 11: locate end of file content for section header table ───────
+	// ── Pass 11: locate end of file content ───────────────────────────────
 	var maxFileOff uint64
 	for _, sec := range e.secs {
 		if sec.shType == SHT_NOBITS || sec.shType == SHT_NULL {
@@ -377,20 +365,16 @@ func (e *emitter) emit() ([]byte, error) {
 
 	e.writeEhdr(buf, entryAddr, phnum, shoff, shnum, shstrndx)
 
-	// Patch null section header [0] for large-count overflow fields.
-	// Spec: e_shnum==0        → sh_size  of shdr[0] holds actual shnum.
-	//       e_phnum==PN_XNUM  → sh_info  of shdr[0] holds actual phnum.
-	//       e_shstrndx==XINDEX→ sh_link  of shdr[0] holds actual shstrndx.
 	if shnum >= SHN_LORESERVE || phnum >= PN_XNUM || shstrndx >= SHN_LORESERVE {
-		off := int(shoff) // shdr[0] is first entry
+		off := int(shoff)
 		if shnum >= SHN_LORESERVE {
-			putU64le(buf[off+32:], uint64(shnum)) // sh_size
+			putU64le(buf[off+32:], uint64(shnum))
 		}
 		if phnum >= PN_XNUM {
-			putU32le(buf[off+44:], phnum) // sh_info
+			putU32le(buf[off+44:], phnum)
 		}
 		if shstrndx >= SHN_LORESERVE {
-			putU32le(buf[off+40:], shstrndx) // sh_link
+			putU32le(buf[off+40:], shstrndx)
 		}
 	}
 
@@ -412,7 +396,71 @@ func (e *emitter) emit() ([]byte, error) {
 	return buf, nil
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// layoutSections assigns fileOff and addr to every section.
+// Sections with pre-assigned addresses (from the linker) are placed at their
+// designated positions; the offset cursor is advanced past them. All other
+// sections are laid out sequentially starting from headerArea.
+func (e *emitter) layoutSections(headerArea uint64) {
+	base := uint64(0)
+	if e.b.fileType == ET_EXEC {
+		base = defaultBase
+	}
+	offset := headerArea
+	for _, sec := range e.secs {
+		if sec.shType == SHT_NULL {
+			sec.fileOff, sec.addr = 0, 0
+			continue
+		}
+
+		// Pre-assigned sections: use linker-assigned addresses directly.
+		// Advance offset past the end of this section's file extent so
+		// subsequent non-pre-assigned sections don't overlap with it.
+		if sec.hasPreassigned {
+			sec.fileOff = sec.preassignedFileOffset
+			sec.addr = sec.preassignedAddr
+			if sec.shType != SHT_NOBITS && len(sec.data) > 0 {
+				if end := sec.fileOff + uint64(len(sec.data)); end > offset {
+					offset = end
+				}
+			}
+			continue
+		}
+
+		if sec.shType == SHT_NOBITS {
+			offset = alignUp(offset, sec.align)
+			sec.fileOff = offset
+			if sec.flags&SHF_ALLOC != 0 {
+				sec.addr = base + offset
+			} else {
+				sec.addr = 0
+			}
+			continue
+		}
+		dataLen := uint64(len(sec.data))
+		if dataLen == 0 {
+			sec.fileOff = offset
+			if sec.flags&SHF_ALLOC != 0 {
+				sec.addr = base + offset
+			} else {
+				sec.addr = 0
+			}
+			continue
+		}
+		offset = alignUp(offset, sec.align)
+		sec.fileOff = offset
+		if sec.flags&SHF_ALLOC != 0 {
+			sec.addr = base + offset
+		} else {
+			sec.addr = 0
+		}
+		offset += dataLen
+	}
+}
+
+// ── helpers (appendSym, buildSymNameIdx, buildRelaData, estimatePhdrs,
+//            buildPhdrs, writeEhdr, writePhdr, writeShdr, strTab,
+//            putU16le/32le/64le/I64le, alignUp, segPermKey)
+// — all unchanged from previous version —
 
 func (e *emitter) appendSym(w *bytes.Buffer, sym Symbol) {
 	nameIdx := e.strtab.add(sym.Name)
@@ -479,50 +527,6 @@ func (e *emitter) buildRelaData(relocs []Reloc, symNameIdx map[string]uint32) []
 	return buf
 }
 
-// layoutSections assigns fileOff and addr to every section.
-func (e *emitter) layoutSections(headerArea uint64) {
-	base := uint64(0)
-	if e.b.fileType == ET_EXEC {
-		base = defaultBase
-	}
-	offset := headerArea
-	for _, sec := range e.secs {
-		if sec.shType == SHT_NULL {
-			sec.fileOff, sec.addr = 0, 0
-			continue
-		}
-		if sec.shType == SHT_NOBITS {
-			offset = alignUp(offset, sec.align)
-			sec.fileOff = offset
-			if sec.flags&SHF_ALLOC != 0 {
-				sec.addr = base + offset
-			} else {
-				sec.addr = 0
-			}
-			continue // NOBITS consumes no file space
-		}
-		dataLen := uint64(len(sec.data))
-		if dataLen == 0 {
-			sec.fileOff = offset
-			if sec.flags&SHF_ALLOC != 0 {
-				sec.addr = base + offset
-			} else {
-				sec.addr = 0
-			}
-			continue
-		}
-		offset = alignUp(offset, sec.align)
-		sec.fileOff = offset
-		if sec.flags&SHF_ALLOC != 0 {
-			sec.addr = base + offset
-		} else {
-			sec.addr = 0
-		}
-		offset += dataLen
-	}
-}
-
-// estimatePhdrs returns the upper-bound program header count before layout.
 func (e *emitter) estimatePhdrs(hasDynamic bool) int {
 	seen := make(map[uint32]bool)
 	hasTLS := false
@@ -534,8 +538,8 @@ func (e *emitter) estimatePhdrs(hasDynamic bool) int {
 			hasTLS = true
 		}
 	}
-	n := len(seen) // PT_LOAD segments
-	n++             // PT_PHDR
+	n := len(seen)
+	n++ // PT_PHDR
 	if e.b.interp != "" {
 		n++
 	}
@@ -545,12 +549,11 @@ func (e *emitter) estimatePhdrs(hasDynamic bool) int {
 	if hasTLS {
 		n++
 	}
-	n++                            // PT_GNU_STACK
-	n += len(e.b.extraSegments)   // caller-supplied custom headers
+	n++
+	n += len(e.b.extraSegments)
 	return n
 }
 
-// buildPhdrs constructs the final slice of program header descriptors.
 func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 	var phs []phdrDesc
 
@@ -563,7 +566,6 @@ func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 	phdrFileOff := uint64(elfHeaderSize)
 	phdrFileSize := uint64(nPhdrs) * phdrEntrySize
 
-	// PT_PHDR
 	phs = append(phs, phdrDesc{
 		pType:  PT_PHDR,
 		flags:  PF_R,
@@ -575,7 +577,6 @@ func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 		align:  8,
 	})
 
-	// PT_INTERP
 	if sec := e.secByName[".interp"]; sec != nil {
 		sz := uint64(len(sec.data))
 		phs = append(phs, phdrDesc{
@@ -590,7 +591,7 @@ func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 		})
 	}
 
-	// PT_LOAD: one per distinct permission group, in standard order.
+	firstLoad := true
 	for _, permFlags := range []uint32{PF_R | PF_X, PF_R, PF_R | PF_W} {
 		var groupSecs []*builtSection
 		for _, sec := range e.secs {
@@ -621,19 +622,29 @@ func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 				}
 			}
 		}
+
+		startOff := first.fileOff
+		startAddr := first.addr
+		if firstLoad {
+			// Extend the first LOAD back to fileOff=0 / vaddr=base so the
+			// ELF header and PT_PHDR are covered by a LOAD segment.
+			startOff = 0
+			startAddr = base
+			firstLoad = false
+		}
+
 		phs = append(phs, phdrDesc{
 			pType:  PT_LOAD,
 			flags:  permFlags,
-			off:    first.fileOff,
-			vaddr:  first.addr,
-			paddr:  first.addr,
-			filesz: fileEnd - first.fileOff,
-			memsz:  memEnd - first.fileOff,
+			off:    startOff,
+			vaddr:  startAddr,
+			paddr:  startAddr,
+			filesz: fileEnd - startOff,
+			memsz:  memEnd - startOff,
 			align:  pageSize,
 		})
 	}
 
-	// PT_DYNAMIC
 	if hasDynamic {
 		if sec := e.secByName[".dynamic"]; sec != nil {
 			sz := uint64(len(sec.data))
@@ -650,8 +661,6 @@ func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 		}
 	}
 
-	// PT_TLS: spans all SHF_TLS sections.
-	// filesz covers initialized (.tdata), memsz includes zero-fill (.tbss).
 	var tlsFirst *builtSection
 	var tlsFilesz, tlsMemsz uint64
 	for _, sec := range e.secs {
@@ -661,14 +670,11 @@ func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 		if tlsFirst == nil {
 			tlsFirst = sec
 		}
-		end := sec.fileOff + sec.memSize
-		rel := end - tlsFirst.fileOff
-		if rel > tlsMemsz {
+		if rel := (sec.fileOff + sec.memSize) - tlsFirst.fileOff; rel > tlsMemsz {
 			tlsMemsz = rel
 		}
 		if sec.shType != SHT_NOBITS {
-			fe := sec.fileOff + uint64(len(sec.data))
-			if frel := fe - tlsFirst.fileOff; frel > tlsFilesz {
+			if frel := (sec.fileOff + uint64(len(sec.data))) - tlsFirst.fileOff; frel > tlsFilesz {
 				tlsFilesz = frel
 			}
 		}
@@ -686,29 +692,21 @@ func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 		})
 	}
 
-	// PT_GNU_STACK — marks stack non-executable.
 	phs = append(phs, phdrDesc{
 		pType: PT_GNU_STACK,
 		flags: PF_R | PF_W,
 		align: pageSize,
 	})
 
-	// Caller-supplied custom segments.
 	for _, seg := range e.b.extraSegments {
 		if len(seg.Sections) == 0 {
-			// No sections: emit as a metadata-only header with no file extent.
 			align := seg.Align
 			if align == 0 {
 				align = 1
 			}
-			phs = append(phs, phdrDesc{
-				pType: seg.Type,
-				flags: seg.Flags,
-				align: align,
-			})
+			phs = append(phs, phdrDesc{pType: seg.Type, flags: seg.Flags, align: align})
 			continue
 		}
-		// Derive extent from the named sections.
 		var first *builtSection
 		var fileEnd, memEnd uint64
 		for _, name := range seg.Sections {
@@ -755,8 +753,6 @@ func (e *emitter) buildPhdrs(hasDynamic bool) []phdrDesc {
 	return phs
 }
 
-// ── binary serialization ──────────────────────────────────────────────────────
-
 type phdrDesc struct {
 	pType  uint32
 	flags  uint32
@@ -777,19 +773,17 @@ func (e *emitter) writeEhdr(buf []byte, entry uint64, phnum uint32, shoff uint64
 	buf[EI_DATA] = ELFDATA2LSB
 	buf[EI_VERSION] = EV_CURRENT
 	buf[EI_OSABI] = ELFOSABI_NONE
-	// bytes 8–15: padding (zero)
 
-	putU16le(buf[16:], uint16(e.b.fileType)) // e_type
-	putU16le(buf[18:], uint16(e.b.arch))     // e_machine
-	putU32le(buf[20:], EV_CURRENT)            // e_version
-	putU64le(buf[24:], entry)                 // e_entry
-	putU64le(buf[32:], elfHeaderSize)         // e_phoff
-	putU64le(buf[40:], shoff)                 // e_shoff
-	putU32le(buf[48:], e.b.flags)             // e_flags
-	putU16le(buf[52:], elfHeaderSize)         // e_ehsize
-	putU16le(buf[54:], phdrEntrySize)         // e_phentsize
+	putU16le(buf[16:], uint16(e.b.fileType))
+	putU16le(buf[18:], uint16(e.b.arch))
+	putU32le(buf[20:], EV_CURRENT)
+	putU64le(buf[24:], entry)
+	putU64le(buf[32:], elfHeaderSize)
+	putU64le(buf[40:], shoff)
+	putU32le(buf[48:], e.b.flags)
+	putU16le(buf[52:], elfHeaderSize)
+	putU16le(buf[54:], phdrEntrySize)
 
-	// Large-count overflow: sentinel values; real counts go in shdr[0].
 	wPhnum := phnum
 	if wPhnum >= PN_XNUM {
 		wPhnum = PN_XNUM
@@ -803,14 +797,13 @@ func (e *emitter) writeEhdr(buf []byte, entry uint64, phnum uint32, shoff uint64
 		wShstrndx = SHN_XINDEX
 	}
 
-	putU16le(buf[56:], uint16(wPhnum))    // e_phnum
-	putU16le(buf[58:], shdrEntrySize)     // e_shentsize
-	putU16le(buf[60:], uint16(wShnum))    // e_shnum
-	putU16le(buf[62:], uint16(wShstrndx)) // e_shstrndx
+	putU16le(buf[56:], uint16(wPhnum))
+	putU16le(buf[58:], shdrEntrySize)
+	putU16le(buf[60:], uint16(wShnum))
+	putU16le(buf[62:], uint16(wShstrndx))
 }
 
 func (e *emitter) writePhdr(buf []byte, ph phdrDesc) {
-	// Elf64_Phdr: p_flags is at offset 4 (before p_offset).
 	putU32le(buf[0:], ph.pType)
 	putU32le(buf[4:], ph.flags)
 	putU64le(buf[8:], ph.off)
@@ -834,7 +827,6 @@ func (e *emitter) writeShdr(buf []byte, sec *builtSection) {
 	if sec.shType == SHT_NOBITS {
 		sz = sec.memSize
 	}
-
 	putU32le(buf[0:], nameIdx)
 	putU32le(buf[4:], sec.shType)
 	putU64le(buf[8:], sec.flags)
@@ -846,8 +838,6 @@ func (e *emitter) writeShdr(buf []byte, sec *builtSection) {
 	putU64le(buf[48:], align)
 	putU64le(buf[56:], sec.entSize)
 }
-
-// ── strTab ────────────────────────────────────────────────────────────────────
 
 type strTab struct {
 	data    []byte
@@ -877,14 +867,11 @@ func (t *strTab) index(s string) uint32 {
 
 func (t *strTab) bytes() []byte { return t.data }
 
-// ── little-endian write helpers ───────────────────────────────────────────────
-
 func putU16le(b []byte, v uint16) { binary.LittleEndian.PutUint16(b, v) }
 func putU32le(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
 func putU64le(b []byte, v uint64) { binary.LittleEndian.PutUint64(b, v) }
 func putI64le(b []byte, v int64)  { binary.LittleEndian.PutUint64(b, uint64(v)) }
 
-// alignUp rounds x up to the next multiple of align (power of 2).
 func alignUp(x, align uint64) uint64 {
 	if align <= 1 {
 		return x
@@ -892,8 +879,6 @@ func alignUp(x, align uint64) uint64 {
 	return (x + align - 1) &^ (align - 1)
 }
 
-// segPermKey maps a section's sh_flags to a canonical PF_* key for PT_LOAD
-// segment grouping.
 func segPermKey(shFlags uint64) uint32 {
 	f := uint32(PF_R)
 	if shFlags&SHF_WRITE != 0 {

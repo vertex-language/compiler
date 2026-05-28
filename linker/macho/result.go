@@ -11,17 +11,17 @@ import (
 // LinkResult holds everything the linker produced and can construct a
 // bin/macho.Builder ready for emission.
 type LinkResult struct {
-	Arch       uint32
-	OutputType OutputType
-	Entry      string
+	Arch        uint32
+	OutputType  OutputType
+	Entry       string
 	InstallName string
-	Platform   binmacho.BuildVersion
+	Platform    binmacho.BuildVersion
 
-	Layout  *Layout
-	Symtab  *SymbolTable
-	Stubs   *StubTable
-	Dylibs  []*DylibFile // in ordinal order (1-based)
-	Rpaths  []string
+	Layout   *Layout
+	Symtab   *SymbolTable
+	Stubs    *StubTable
+	Dylibs   []*DylibFile // in ordinal order (1-based)
+	Rpaths   []string
 	DyldMode binmacho.DyldMode
 }
 
@@ -107,10 +107,10 @@ func (r *LinkResult) Builder() *binmacho.Builder {
 			continue
 		}
 		sym := binmacho.Symbol{
-			Name:     rs.Name,
-			Global:   rs.IsGlobal,
-			Weak:     rs.IsWeak,
-			Value:    rs.Value,
+			Name:   rs.Name,
+			Global: rs.IsGlobal,
+			Weak:   rs.IsWeak,
+			Value:  rs.Value,
 		}
 		if rs.Kind == kindDefined && !rs.IsAbs {
 			sym.SegmentName = rs.SegmentName
@@ -149,7 +149,8 @@ func buildChainedFixups(r *LinkResult) []byte {
 		return nil
 	}
 
-	pageSize := uint32(binmacho.PageSize())
+	// binmacho.PageSize is a typed constant, not a function.
+	pageSize := uint32(binmacho.PageSize)
 	format := binmacho.ChainedPtr64Offset
 	if r.Arch == ArchARM64 {
 		format = binmacho.ChainedPtr64Offset
@@ -164,12 +165,10 @@ func buildChainedFixups(r *LinkResult) []byte {
 			Name:       e.SymName,
 		})
 
-		// Find the GOT slot's segment + offset.
 		gotMs := r.Layout.SectionByKey("__DATA_CONST", "__got")
 		if gotMs == nil {
 			continue
 		}
-		// Determine segment index (0-based, excluding __PAGEZERO).
 		segIdx := segmentIndex(r.Layout, "__DATA_CONST")
 		cfb.AddBind(binmacho.ChainedBind{
 			SegIndex:  segIdx,
@@ -178,7 +177,6 @@ func buildChainedFixups(r *LinkResult) []byte {
 		})
 	}
 
-	// Collect per-segment file offsets and VM sizes.
 	segOffsets, segSizes := collectSegExtents(r.Layout)
 	return cfb.Build(segOffsets, segSizes)
 }
@@ -204,7 +202,6 @@ func buildExportTrie(r *LinkResult) []byte {
 func buildLegacyDyldInfo(r *LinkResult) (rebase, bind, weakBind, lazyBind, exportTrie []byte) {
 	dib := binmacho.NewDyldInfoBuilder()
 
-	// Non-lazy binds for GOT slots.
 	if r.Stubs != nil {
 		gotMs := r.Layout.SectionByKey("__DATA_CONST", "__got")
 		if gotMs != nil {
@@ -221,7 +218,6 @@ func buildLegacyDyldInfo(r *LinkResult) (rebase, bind, weakBind, lazyBind, expor
 		}
 	}
 
-	// Exports.
 	for _, rs := range r.Symtab.All() {
 		if !rs.IsGlobal || rs.Kind != kindDefined {
 			continue

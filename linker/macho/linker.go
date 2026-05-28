@@ -76,6 +76,18 @@ func (l *Linker) AddArchive(a *Archive) { l.archives = append(l.archives, a) }
 // determines the 1-based dylib ordinals written into the output.
 func (l *Linker) AddDylib(d *DylibFile) { l.dylibs = append(l.dylibs, d) }
 
+// AddDylibByInstallName adds a dynamic library dependency by its canonical
+// install name only, without a parsed DylibFile. Used when cross-linking
+// without SDK stubs available — the LC_LOAD_DYLIB is emitted and dyld
+// resolves it at runtime from the shared cache.
+func (l *Linker) AddDylibByInstallName(name string) {
+	l.dylibs = append(l.dylibs, &DylibFile{
+		Path:    name,
+		Soname:  name,
+		symbols: make(map[string]*DylibSymbol),
+	})
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Link — runs all phases
 // ──────────────────────────────────────────────────────────────────────────────

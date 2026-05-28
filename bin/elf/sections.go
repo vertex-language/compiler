@@ -310,35 +310,23 @@ const (
 
 // Section describes a single ELF section to be emitted into the binary.
 type Section struct {
-	// Name is the section name string, e.g. ".text", ".data", ".rodata".
-	Name string
-
-	// Type is the SHT_* section type constant.
-	Type uint32
-
-	// Flags is the SHF_* bitmask: SHF_ALLOC | SHF_EXECINSTR, etc.
-	Flags uint64
-
-	// Data holds the raw section content. For SHT_NOBITS (.bss) this
-	// should be nil or empty; set Size to the desired in-memory byte count.
-	Data []byte
-
-	// Align is the required address and file alignment (power of two, ≥ 1).
-	// Zero is treated as 1.
-	Align uint64
-
-	// Size overrides the section size for SHT_NOBITS sections. Ignored for
-	// sections with Data content; their size is len(Data).
-	Size uint64
-
-	// Link and Info carry sh_link / sh_info semantics defined per section
-	// type. Most user sections leave these zero.
-	Link uint32
-	Info uint32
-
-	// EntSize is the entry size for table sections (SHT_SYMTAB, SHT_RELA,
-	// SHT_DYNAMIC, etc.). Leave zero for variable-content sections.
+	Name    string
+	Type    uint32
+	Flags   uint64
+	Data    []byte
+	Align   uint64
+	Size    uint64
+	Link    uint32
+	Info    uint32
 	EntSize uint64
+
+	// PreassignedAddr and PreassignedFileOffset, when non-zero, instruct the
+	// emitter to place this section at exactly these addresses rather than
+	// computing new ones. Set by the ELF linker so that bytes patched at link
+	// time (PLT stubs, relocated .text) are serialized at the addresses the
+	// linker used when patching them.
+	PreassignedAddr       uint64
+	PreassignedFileOffset uint64
 }
 
 // Symbol describes a symbol-table entry to include in .symtab.

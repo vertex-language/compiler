@@ -512,6 +512,13 @@ func (e *emitter) buildDynamicSections(dynSec *builtSection) {
 		entries = append(entries, dynEntry{DT_RUNPATH, uint64(dynstr.add(e.b.rpath))})
 	}
 
+	// Intern PLT symbol names into .dynstr now so DT_STRSZ accounts for them.
+	// We collect the offsets here and use them when building .dynsym below.
+	dynSymNameOffs := make([]uint32, len(e.b.dynSyms))
+	for i, name := range e.b.dynSyms {
+		dynSymNameOffs[i] = dynstr.add(name)
+	}
+
 	if sec := e.secByName[".dynstr"]; sec != nil {
 		entries = append(entries, dynEntry{DT_STRTAB, sec.addr})
 	}
@@ -543,19 +550,18 @@ func (e *emitter) buildDynamicSections(dynSec *builtSection) {
 	}
 	if sec := e.secByName[".gnu.version_r"]; sec != nil {
 		entries = append(entries, dynEntry{DT_VERNEED, sec.addr})
-		// Count Verneed entries by scanning sh_info if set, else leave to caller.
 		if sec.info > 0 {
 			entries = append(entries, dynEntry{DT_VERNEEDNUM, uint64(sec.info)})
 		}
 	}
 
-	// Finalize .dynstr size now that all strings are interned.
 	dynstrData := dynstr.bytes()
 	for i, en := range entries {
 		if en.tag == DT_STRTAB {
 			tail := make([]dynEntry, len(entries[i+1:]))
 			copy(tail, entries[i+1:])
-			entries = append(entries[:i+1], append([]dynEntry{{DT_STRSZ, uint64(len(dynstrData))}}, tail...)...)
+			entries = append(entries[:i+1],
+				append([]dynEntry{{DT_STRSZ, uint64(len(dynstrData))}}, tail...)...)
 			break
 		}
 	}
@@ -573,12 +579,30 @@ func (e *emitter) buildDynamicSections(dynSec *builtSection) {
 	if sec := e.secByName[".dynstr"]; sec != nil {
 		sec.data = dynstrData
 		sec.memSize = uint64(len(dynstrData))
+
 		if dynsym := e.secByName[".dynsym"]; dynsym != nil {
 			dynsym.link = uint32(sec.shIdx)
-			dynsym.data = make([]byte, symEntrySize) // null entry
-			dynsym.memSize = symEntrySize
+
+			// Null entry (index 0) followed by one entry per PLT symbol.
+			// The order must match PLTSyms: dynsym[i+1] corresponds to
+			// the JUMP_SLOT relocation at .rela.plt[i] (symIdx = i+1).
+			symData := make([]byte, symEntrySize) // null entry
+			for i, nameOff := range dynSymNameOffs {
+				_ = i
+				var s [symEntrySize]byte
+				putU32le(s[0:], nameOff)                       // st_name
+				s[4] = (STB_GLOBAL << 4) | STT_FUNC           // st_info
+				// st_other = 0 (STV_DEFAULT)
+				// st_shndx = 0 (SHN_UNDEF)
+				// st_value = 0
+				// st_size  = 0
+				symData = append(symData, s[:]...)
+			}
+			dynsym.data = symData
+			dynsym.memSize = uint64(len(symData))
 		}
 	}
+
 	if dynSec != nil {
 		dynSec.data = buf.Bytes()
 		dynSec.memSize = uint64(len(dynSec.data))
